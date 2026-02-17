@@ -1,0 +1,534 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Touch Annotator</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg: #0d0d12;
+      --surface: #16161f;
+      --surface2: #1e1e2a;
+      --border: #2a2a3a;
+      --accent: #4a9eff;
+      --accent-dim: #1a3a5a;
+      --text: #d0d0e0;
+      --text-dim: #707088;
+      --green: #4aff8a;
+      --green-dim: #0a3a1a;
+      --red: #ff4a6a;
+      --yellow: #ffcc44;
+    }
+
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: 'Inter', system-ui, -apple-system, sans-serif;
+      font-size: 14px;
+      height: 100vh;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+    }
+
+    /* ── Header ── */
+    .app-header {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 8px 16px;
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      flex-shrink: 0;
+      min-height: 44px;
+    }
+    .app-title { font-size: 15px; font-weight: 600; color: var(--accent); }
+    .app-crumb { color: var(--text-dim); font-size: 13px; }
+    .app-crumb .crumb-active { color: var(--text); }
+
+    /* ── Screens ── */
+    .screen { display: none; flex: 1; overflow: hidden; }
+    .screen.active { display: flex; flex-direction: column; }
+
+    /* ── Buttons ── */
+    .btn {
+      display: inline-flex; align-items: center; gap: 6px;
+      padding: 7px 14px; border-radius: 6px;
+      border: 1px solid var(--border); background: var(--surface2);
+      color: var(--text); cursor: pointer; font-size: 13px;
+      transition: background 0.15s, border-color 0.15s;
+      white-space: nowrap; user-select: none;
+    }
+    .btn:hover { background: #26263a; border-color: #3a3a5a; }
+    .btn:disabled { opacity: 0.35; cursor: not-allowed; }
+    .btn-primary { background: var(--accent-dim); border-color: var(--accent); color: #9ad0ff; }
+    .btn-primary:hover { background: #1e4a7a; }
+    .btn-sm { padding: 4px 10px; font-size: 12px; }
+    .btn-icon { padding: 6px 8px; }
+
+    /* ═══════════════════════════════════
+       UPLOAD SCREEN
+    ═══════════════════════════════════ */
+    #upload-screen {
+      align-items: center;
+      justify-content: center;
+      gap: 20px;
+      padding: 40px 20px;
+      overflow-y: auto;
+    }
+    .drop-zone {
+      width: 100%; max-width: 540px;
+      border: 2px dashed var(--border);
+      border-radius: 12px;
+      padding: 44px 32px;
+      text-align: center;
+      cursor: pointer;
+      transition: border-color 0.2s, background 0.2s;
+    }
+    .drop-zone.drag-over { border-color: var(--accent); background: rgba(74,158,255,0.05); }
+    .drop-zone-icon { font-size: 36px; margin-bottom: 10px; }
+    .drop-zone h2 { font-size: 15px; margin-bottom: 6px; }
+    .drop-zone p { color: var(--text-dim); font-size: 13px; }
+    #file-input { display: none; }
+
+    .file-list { width: 100%; max-width: 540px; display: flex; flex-direction: column; gap: 8px; }
+    .file-item {
+      display: flex; align-items: center; gap: 10px;
+      padding: 10px 14px;
+      background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
+    }
+    .file-item-icon { font-size: 18px; }
+    .file-item-name { flex: 1; font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .file-item-size { color: var(--text-dim); font-size: 12px; white-space: nowrap; }
+    .file-item-remove {
+      width: 22px; height: 22px; border-radius: 50%;
+      border: 1px solid var(--border); background: none;
+      color: var(--text-dim); cursor: pointer; font-size: 13px;
+      display: flex; align-items: center; justify-content: center;
+      transition: border-color 0.15s, color 0.15s;
+    }
+    .file-item-remove:hover { border-color: var(--red); color: var(--red); }
+
+    .upload-footer { display: flex; gap: 8px; align-items: center; width: 100%; max-width: 540px; }
+    .upload-footer-hint { flex: 1; color: var(--text-dim); font-size: 12px; }
+
+    /* ═══════════════════════════════════
+       SYNC SCREEN
+    ═══════════════════════════════════ */
+    #sync-screen { overflow: hidden; }
+    .sync-instruction {
+      padding: 10px 16px;
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      font-size: 13px; color: var(--text-dim);
+      flex-shrink: 0;
+    }
+    .sync-instruction strong { color: var(--text); }
+
+    .sync-videos-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(360px, 1fr));
+      gap: 1px;
+      background: var(--border);
+      flex: 1;
+      overflow-y: auto;
+      min-height: 0;
+    }
+    .sync-panel {
+      background: var(--bg); padding: 12px;
+      display: flex; flex-direction: column; gap: 8px;
+    }
+    .sync-panel-title {
+      font-size: 12px; color: var(--text-dim);
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    }
+    .sync-video-wrap {
+      flex: 1; min-height: 0;
+      display: flex; flex-direction: column;
+    }
+    .sync-panel video {
+      width: 100%; flex: 1; min-height: 0;
+      border-radius: 6px; background: #000;
+      object-fit: contain; display: block;
+      max-height: min(60vh, 540px);
+    }
+    .sync-panel.kbd-focus { outline: 2px solid var(--accent); outline-offset: -2px; border-radius: 4px; }
+    .sync-kbd-hint {
+      font-size: 11px; color: var(--text-dim); text-align: center;
+      opacity: 0; transition: opacity 0.2s;
+    }
+    .sync-panel.kbd-focus .sync-kbd-hint { opacity: 1; }
+    .sync-panel-controls { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+    .sync-time {
+      font-family: monospace; font-size: 13px; color: var(--accent);
+      min-width: 68px;
+    }
+    input[type=range].sync-scrubber {
+      flex: 1; min-width: 80px; cursor: pointer;
+      accent-color: var(--accent);
+    }
+    .sync-set-btn {
+      padding: 5px 12px; border-radius: 6px; font-size: 12px; font-weight: 500;
+      border: 1px solid var(--border); background: var(--surface2);
+      color: var(--text-dim); cursor: pointer; transition: all 0.15s;
+      white-space: nowrap;
+    }
+    .sync-set-btn:hover { border-color: var(--accent); color: var(--accent); }
+    .sync-set-btn.is-set { background: var(--green-dim); border-color: var(--green); color: var(--green); }
+    .sync-fps-row { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--text-dim); }
+    .fps-badge {
+      background: var(--surface2); border: 1px solid var(--border);
+      border-radius: 4px; padding: 2px 8px;
+      font-family: monospace; font-size: 12px; color: var(--accent);
+    }
+    .fps-override { width: 52px; }
+
+    .sync-footer {
+      padding: 10px 16px;
+      background: var(--surface); border-top: 1px solid var(--border);
+      display: flex; align-items: center; justify-content: space-between; gap: 12px;
+      flex-shrink: 0;
+    }
+    .sync-dots { display: flex; gap: 6px; align-items: center; }
+    .sync-dot {
+      width: 8px; height: 8px; border-radius: 50%;
+      background: var(--border); transition: background 0.2s;
+    }
+    .sync-dot.is-set { background: var(--green); }
+    .sync-footer-hint { color: var(--text-dim); font-size: 13px; }
+
+    /* ═══════════════════════════════════
+       ANNOTATE SCREEN
+    ═══════════════════════════════════ */
+    #annotate-screen { overflow: hidden; }
+    .annotate-layout {
+      display: flex; flex: 1; overflow: hidden; min-height: 0;
+    }
+
+    /* Video grid */
+    .video-grid {
+      flex: 1; display: grid; background: #000;
+      overflow: hidden; min-height: 0;
+    }
+    .video-grid.count-1 { grid-template-columns: 1fr; }
+    .video-grid.count-2 { grid-template-columns: 1fr 1fr; }
+    .video-grid.count-3 { grid-template-columns: 1fr 1fr 1fr; }
+    .video-grid.count-4 { grid-template-columns: 1fr 1fr; grid-template-rows: 1fr 1fr; }
+
+    .video-cell { position: relative; background: #000; border: 1px solid #1a1a1a; overflow: hidden; }
+    .video-cell video { width: 100%; height: 100%; object-fit: contain; display: block; }
+    .video-cell-label {
+      position: absolute; top: 6px; left: 8px;
+      font-size: 11px; background: rgba(0,0,0,0.65);
+      padding: 2px 7px; border-radius: 4px; color: #bbb; pointer-events: none;
+    }
+    .video-cell-fps {
+      position: absolute; top: 6px; right: 8px;
+      font-size: 11px; background: rgba(0,0,0,0.55);
+      padding: 2px 6px; border-radius: 4px; color: #777; pointer-events: none;
+    }
+
+    /* Main column (grid + transport) */
+    .annotate-main { display: flex; flex-direction: column; flex: 1; min-width: 0; overflow: hidden; }
+
+    /* Transport */
+    .transport {
+      background: var(--surface); border-top: 1px solid var(--border);
+      padding: 8px 14px; flex-shrink: 0;
+    }
+    .transport-row1 { display: flex; align-items: center; gap: 10px; margin-bottom: 6px; }
+    .frame-display {
+      font-family: monospace; font-size: 22px; font-weight: 700;
+      color: var(--accent); min-width: 110px; line-height: 1;
+    }
+    .time-display {
+      font-family: monospace; font-size: 12px; color: var(--text-dim);
+      min-width: 72px;
+    }
+    .transport-btns { display: flex; gap: 3px; }
+    .transport-btns .btn { font-size: 15px; padding: 5px 9px; }
+    input[type=range].master-scrubber {
+      width: 100%; cursor: pointer; accent-color: var(--accent);
+    }
+
+    /* Sidebar */
+    .annotate-sidebar {
+      width: 280px; min-width: 220px;
+      background: var(--surface); border-left: 1px solid var(--border);
+      display: flex; flex-direction: column; overflow: hidden;
+    }
+    .sidebar-section {
+      padding: 12px 14px;
+      border-bottom: 1px solid var(--border);
+      flex-shrink: 0;
+    }
+    .sidebar-section h3 {
+      font-size: 11px; text-transform: uppercase;
+      letter-spacing: 0.06em; color: var(--text-dim); margin-bottom: 10px;
+    }
+    .surface-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+    .surface-btn {
+      padding: 8px 6px; border-radius: 6px; text-align: center;
+      border: 1px solid var(--border); background: var(--surface2);
+      color: var(--text-dim); cursor: pointer; font-size: 13px;
+      transition: all 0.15s; user-select: none;
+    }
+    .surface-btn:hover { border-color: var(--accent); color: var(--text); }
+    .surface-btn.selected { background: var(--accent-dim); border-color: var(--accent); color: #9ad0ff; }
+
+    .log-btn {
+      width: 100%; padding: 10px;
+      font-size: 14px; font-weight: 600;
+      background: var(--green-dim); border: 1px solid var(--green);
+      color: var(--green); border-radius: 6px;
+      cursor: pointer; transition: background 0.15s;
+      margin-top: 8px; user-select: none;
+    }
+    .log-btn:hover:not(:disabled) { background: #103a18; }
+    .log-btn:disabled { opacity: 0.3; cursor: not-allowed; }
+    .log-btn .hint { font-size: 11px; opacity: 0.6; font-weight: 400; }
+
+    /* Annotations list */
+    .annotations-header {
+      padding: 8px 14px 4px;
+      font-size: 11px; text-transform: uppercase;
+      letter-spacing: 0.06em; color: var(--text-dim);
+      display: flex; align-items: center; justify-content: space-between;
+      flex-shrink: 0;
+    }
+    .ann-count { color: var(--text); font-weight: 600; font-size: 13px; text-transform: none; letter-spacing: 0; }
+    .annotations-list { flex: 1; overflow-y: auto; }
+    .ann-empty { padding: 20px 14px; color: var(--text-dim); font-size: 13px; text-align: center; }
+    .annotation-row {
+      display: flex; align-items: center; gap: 6px;
+      padding: 6px 14px;
+      border-bottom: 1px solid #1a1a28;
+      font-size: 12px; cursor: pointer;
+      transition: background 0.1s;
+    }
+    .annotation-row:hover { background: var(--surface2); }
+    .annotation-row.current { background: rgba(74,158,255,0.1); }
+    .ann-frame { font-family: monospace; color: var(--accent); min-width: 52px; }
+    .ann-time { color: var(--text-dim); min-width: 54px; font-family: monospace; }
+    .ann-surface { flex: 1; color: var(--text); }
+    .ann-del {
+      opacity: 0; border: none; background: none; color: var(--red);
+      cursor: pointer; font-size: 15px; padding: 0 2px; line-height: 1;
+    }
+    .annotation-row:hover .ann-del { opacity: 1; }
+    .annotation-row.editing {
+      background: rgba(74,158,255,0.12);
+      border-left: 2px solid var(--accent);
+      padding-left: 12px;
+    }
+    .ann-unassigned { color: var(--yellow); font-style: italic; }
+    .ann-comment { color: var(--text-dim); font-style: italic; font-size: 11px; margin-top: 1px; }
+    #other-comment {
+      width: 100%; padding: 7px 10px;
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: 6px; color: var(--text); font-size: 13px;
+      outline: none; transition: border-color 0.15s;
+    }
+    #other-comment:focus { border-color: var(--accent); }
+    #other-comment.required { border-color: var(--red); }
+    #surface-section-title { transition: color 0.15s; }
+    .sidebar-section:has(#surface-section-title[data-editing]) h3 { color: var(--accent); }
+
+    .sidebar-footer {
+      padding: 10px 14px;
+      border-top: 1px solid var(--border);
+      display: flex; gap: 6px; flex-shrink: 0;
+    }
+
+    /* ── FPS Detection overlay ── */
+    #fps-overlay {
+      position: fixed; inset: 0;
+      background: rgba(0,0,0,0.8);
+      display: none; align-items: center; justify-content: center;
+      z-index: 100; backdrop-filter: blur(4px);
+    }
+    #fps-overlay.show { display: flex; }
+    .fps-dialog {
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: 12px; padding: 28px 36px;
+      max-width: 380px; width: 90%; text-align: center;
+    }
+    .fps-dialog h2 { font-size: 15px; margin-bottom: 8px; }
+    .fps-dialog p { color: var(--text-dim); font-size: 13px; margin-bottom: 20px; }
+    .fps-spinner {
+      width: 30px; height: 30px;
+      border: 3px solid var(--border); border-top-color: var(--accent);
+      border-radius: 50%; animation: spin 0.8s linear infinite;
+      margin: 0 auto 12px;
+    }
+    .fps-status { font-size: 13px; color: var(--text-dim); min-height: 18px; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* ── Toast ── */
+    #toast {
+      position: fixed; bottom: 20px; left: 50%;
+      transform: translateX(-50%);
+      background: var(--surface2); border: 1px solid var(--border);
+      padding: 7px 16px; border-radius: 6px; font-size: 13px;
+      z-index: 200; opacity: 0; transition: opacity 0.2s; pointer-events: none;
+      white-space: nowrap;
+    }
+    #toast.show { opacity: 1; }
+
+    /* ── Scrollbars ── */
+    ::-webkit-scrollbar { width: 5px; height: 5px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+    ::-webkit-scrollbar-thumb:hover { background: #3a3a5a; }
+  </style>
+</head>
+<body>
+
+<!-- ══════════════════════════════════════════
+     HEADER
+══════════════════════════════════════════ -->
+<header class="app-header">
+  <span class="app-title">Touch Annotator</span>
+  <span class="app-crumb" id="header-crumb"></span>
+</header>
+
+<!-- ══════════════════════════════════════════
+     SCREEN 1 — UPLOAD
+══════════════════════════════════════════ -->
+<div id="upload-screen" class="screen active">
+  <div class="drop-zone" id="drop-zone">
+    <div class="drop-zone-icon">🎬</div>
+    <h2>Drop MP4 files here</h2>
+    <p>or click to browse — up to 4 videos</p>
+    <input type="file" id="file-input" accept="video/mp4,video/*" multiple>
+  </div>
+
+  <div class="file-list" id="file-list"></div>
+
+  <div class="upload-footer">
+    <span class="upload-footer-hint">Select 1–4 MP4 files of the same match</span>
+    <button class="btn btn-primary" id="upload-continue" disabled>Continue to Sync →</button>
+  </div>
+</div>
+
+<!-- ══════════════════════════════════════════
+     SCREEN 2 — SYNC SETUP
+══════════════════════════════════════════ -->
+<div id="sync-screen" class="screen">
+  <div class="sync-instruction">
+    <strong>Step 2 – Sync Setup.</strong>
+    Scrub each video to the <strong>exact same moment</strong> (e.g. a whistle, a kick), then click <strong>Set Sync Point</strong>. With one video you can set any frame as "frame 0".
+  </div>
+
+  <div class="sync-videos-grid" id="sync-videos-grid"></div>
+
+  <div class="sync-footer">
+    <div style="display:flex;gap:12px;align-items:center;">
+      <div class="sync-dots" id="sync-dots"></div>
+      <span class="sync-footer-hint" id="sync-footer-hint">Set sync point for each video</span>
+    </div>
+    <div style="display:flex;gap:8px;">
+      <button class="btn" id="sync-back">← Back</button>
+      <button class="btn btn-primary" id="sync-continue" disabled>Annotate →</button>
+    </div>
+  </div>
+</div>
+
+<!-- ══════════════════════════════════════════
+     SCREEN 3 — ANNOTATE
+══════════════════════════════════════════ -->
+<div id="annotate-screen" class="screen">
+  <div class="annotate-layout">
+
+    <!-- Left: video grid + transport -->
+    <div class="annotate-main">
+      <div class="video-grid" id="video-grid"></div>
+
+      <div class="transport">
+        <div class="transport-row1">
+          <div>
+            <div class="frame-display" id="frame-display">Frame 0</div>
+            <div class="time-display" id="time-display">0.000 s</div>
+          </div>
+          <div class="transport-btns">
+            <button class="btn btn-icon" id="btn-start" title="Go to start">⏮</button>
+            <button class="btn btn-icon" id="btn-prev" title="Previous frame (←)">◀</button>
+            <button class="btn btn-icon btn-primary" id="btn-play" title="Play/Pause (Space)">▶</button>
+            <button class="btn btn-icon" id="btn-next" title="Next frame (→)">▶▶</button>
+            <button class="btn btn-icon" id="btn-end" title="Go to end">⏭</button>
+          </div>
+          <div style="display:flex;align-items:center;gap:6px;margin-left:auto;">
+            <span style="font-size:12px;color:var(--text-dim);">Speed</span>
+            <select id="playback-rate" style="background:var(--surface2);border:1px solid var(--border);color:var(--text);border-radius:5px;padding:4px 6px;font-size:12px;cursor:pointer;">
+              <option value="0.25">0.25×</option>
+              <option value="0.5">0.5×</option>
+              <option value="1" selected>1×</option>
+              <option value="2">2×</option>
+            </select>
+          </div>
+          <button class="btn btn-sm" id="btn-re-sync" title="Go back to sync screen" style="margin-left:4px;">Re-sync</button>
+        </div>
+        <input type="range" class="master-scrubber" id="master-scrubber" min="0" max="100" step="0.001" value="0">
+      </div>
+    </div>
+
+    <!-- Right: annotation sidebar -->
+    <div class="annotate-sidebar">
+
+      <div class="sidebar-section">
+        <h3 id="surface-section-title">Touch Surface</h3>
+        <div class="surface-grid" id="surface-grid">
+          <button class="surface-btn" data-surface="foot">👟 Foot</button>
+          <button class="surface-btn" data-surface="head">🏃 Head</button>
+          <button class="surface-btn" data-surface="arm">💪 Arm</button>
+          <button class="surface-btn" data-surface="torso">🧥 Torso</button>
+          <button class="surface-btn" data-surface="other" style="grid-column:span 2;">Other</button>
+        </div>
+        <div id="other-comment-wrap" style="display:none; margin-top:8px;">
+          <input type="text" id="other-comment" placeholder="Required: describe the touch…"
+                 maxlength="120" autocomplete="off">
+        </div>
+        <button class="log-btn" id="log-btn" disabled>
+          Log Touch &nbsp;<span class="hint">[T]</span>
+        </button>
+      </div>
+
+      <div class="annotations-header">
+        <span>Touches</span>
+        <span class="ann-count" id="ann-count">0</span>
+      </div>
+
+      <div class="annotations-list" id="annotations-list">
+        <div class="ann-empty" id="ann-empty">No touches logged yet</div>
+      </div>
+
+      <div class="sidebar-footer">
+        <button class="btn btn-primary" id="export-csv" style="flex:1;" disabled>Export CSV</button>
+        <button class="btn btn-sm" id="clear-all" title="Delete all annotations">Clear</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ══════════════════════════════════════════
+     FPS DETECTION OVERLAY
+══════════════════════════════════════════ -->
+<div id="fps-overlay">
+  <div class="fps-dialog">
+    <div class="fps-spinner"></div>
+    <h2>Detecting frame rate…</h2>
+    <p>Playing each video briefly to measure FPS.<br>This takes a few seconds.</p>
+    <div class="fps-status" id="fps-status">Initialising…</div>
+  </div>
+</div>
+
+<!-- ══════════════════════════════════════════
+     TOAST
+══════════════════════════════════════════ -->
+<div id="toast"></div>
+
+<script src="app.js"></script>
+</body>
+</html>
