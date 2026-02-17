@@ -377,6 +377,81 @@
     }
     #toast.show { opacity: 1; }
 
+    /* ── Help modal ── */
+    #help-overlay {
+      position: fixed; inset: 0;
+      background: rgba(0,0,0,0.75);
+      display: none; align-items: center; justify-content: center;
+      z-index: 150; backdrop-filter: blur(4px);
+      padding: 20px;
+    }
+    #help-overlay.show { display: flex; }
+    .help-dialog {
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: 12px; padding: 0;
+      max-width: 540px; width: 100%;
+      max-height: 90vh; overflow-y: auto;
+      display: flex; flex-direction: column;
+    }
+    .help-header {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 16px 20px 12px;
+      border-bottom: 1px solid var(--border);
+      position: sticky; top: 0; background: var(--surface); z-index: 1;
+    }
+    .help-header h2 { font-size: 15px; color: var(--accent); }
+    .help-close {
+      border: none; background: none; color: var(--text-dim);
+      font-size: 20px; cursor: pointer; line-height: 1; padding: 0 4px;
+    }
+    .help-close:hover { color: var(--text); }
+    .help-body { padding: 16px 20px 20px; display: flex; flex-direction: column; gap: 16px; }
+    .help-section h3 {
+      font-size: 11px; text-transform: uppercase; letter-spacing: 0.07em;
+      color: var(--accent); margin-bottom: 8px;
+    }
+    .help-section p { font-size: 13px; color: var(--text-dim); line-height: 1.6; }
+    .help-section p + p { margin-top: 6px; }
+    .help-section strong { color: var(--text); }
+    .help-steps { list-style: none; display: flex; flex-direction: column; gap: 8px; }
+    .help-steps li {
+      font-size: 13px; color: var(--text-dim); line-height: 1.5;
+      position: relative;
+      padding-left: 30px;
+    }
+    .help-steps li::before {
+      content: attr(data-n);
+      position: absolute; left: 0; top: 1px;
+      width: 20px; height: 20px; border-radius: 50%;
+      background: var(--accent-dim); border: 1px solid var(--accent);
+      color: #9ad0ff; font-size: 11px; font-weight: 600;
+      display: flex; align-items: center; justify-content: center;
+    }
+    .help-keys { width: 100%; border-collapse: collapse; font-size: 12px; }
+    .help-keys tr { border-bottom: 1px solid #1e1e2a; }
+    .help-keys tr:last-child { border-bottom: none; }
+    .help-keys td { padding: 5px 6px; vertical-align: middle; }
+    .help-keys td:first-child { white-space: nowrap; }
+    .help-keys .kbd {
+      display: inline-block; padding: 2px 7px;
+      background: var(--surface2); border: 1px solid var(--border);
+      border-radius: 4px; font-family: monospace; font-size: 11px;
+      color: var(--text); margin: 1px 2px;
+    }
+    .help-keys td:last-child { color: var(--text-dim); }
+    .help-tip {
+      background: rgba(74,158,255,0.07); border: 1px solid rgba(74,158,255,0.2);
+      border-radius: 6px; padding: 8px 12px;
+      font-size: 12px; color: var(--text-dim); line-height: 1.5;
+    }
+    .help-tip strong { color: var(--accent); }
+    .help-btn {
+      padding: 4px 10px; border-radius: 6px; font-size: 12px;
+      border: 1px solid var(--border); background: var(--surface2);
+      color: var(--text-dim); cursor: pointer;
+    }
+    .help-btn:hover { border-color: var(--accent); color: var(--accent); }
+
     /* ── Scrollbars ── */
     ::-webkit-scrollbar { width: 5px; height: 5px; }
     ::-webkit-scrollbar-track { background: transparent; }
@@ -430,6 +505,7 @@
       <span class="sync-footer-hint" id="sync-footer-hint">Set sync point for each video</span>
     </div>
     <div style="display:flex;gap:8px;">
+      <button class="help-btn" id="sync-help-btn" title="Help">? Help</button>
       <button class="btn" id="sync-back">← Back</button>
       <button class="btn btn-primary" id="sync-continue" disabled>Annotate →</button>
     </div>
@@ -468,6 +544,7 @@
               <option value="2">2×</option>
             </select>
           </div>
+          <button class="help-btn" id="annotate-help-btn" title="Help" style="margin-left:4px;">? Help</button>
           <button class="btn btn-sm" id="btn-re-sync" title="Go back to sync screen" style="margin-left:4px;">Re-sync</button>
         </div>
         <input type="range" class="master-scrubber" id="master-scrubber" min="0" max="100" step="0.001" value="0">
@@ -509,6 +586,19 @@
         <button class="btn btn-sm" id="clear-all" title="Delete all annotations">Clear</button>
       </div>
     </div>
+  </div>
+</div>
+
+<!-- ══════════════════════════════════════════
+     HELP MODAL
+══════════════════════════════════════════ -->
+<div id="help-overlay">
+  <div class="help-dialog">
+    <div class="help-header">
+      <h2 id="help-title">Help</h2>
+      <button class="help-close" id="help-close">✕</button>
+    </div>
+    <div class="help-body" id="help-body"></div>
   </div>
 </div>
 

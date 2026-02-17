@@ -918,5 +918,109 @@ document.addEventListener('keydown', e => {
     case '3': selectSurface('arm');   break;
     case '4': selectSurface('torso'); break;
     case '5': selectSurface('other'); break;
+    case '?':
+    case 'h':
+    case 'H':
+      openHelp('annotate');
+      break;
   }
 });
+
+// ═══════════════════════════════════════════════════════════
+// HELP MODAL
+// ═══════════════════════════════════════════════════════════
+
+const HELP_CONTENT = {
+  sync: {
+    title: 'Sync Setup — How it works',
+    body: `
+      <div class="help-section">
+        <h3>Goal</h3>
+        <p>Align all your videos to the <strong>same real-world moment</strong> so the frame counter stays in sync across every camera angle.</p>
+      </div>
+      <div class="help-section">
+        <h3>Steps</h3>
+        <ol class="help-steps">
+          <li data-n="1">Pick a clear, unambiguous event visible in all videos, such as a ball bounce.</li>
+          <li data-n="2">Scrub each video panel independently to that exact moment using the scrubber or frame-step buttons.</li>
+          <li data-n="3">Click <strong>Set Sync Point</strong> in each panel. The dot in the footer turns green when set.</li>
+          <li data-n="4">Once all dots are green, click <strong>Annotate →</strong> to begin logging touches.</li>
+        </ol>
+      </div>
+      <div class="help-section">
+        <h3>Controls (click a panel first to focus it)</h3>
+        <table class="help-keys">
+          <tr><td><span class="kbd">←</span> <span class="kbd">→</span></td><td>Step one frame back / forward</td></tr>
+          <tr><td><span class="kbd">Space</span></td><td>Play / Pause</td></tr>
+          <tr><td>Scrubber</td><td>Drag to any position in the video</td></tr>
+          <tr><td>FPS box</td><td>Override the auto-detected frame rate</td></tr>
+        </table>
+      </div>
+      <div class="help-tip">
+        <strong>Tip:</strong> The sharper the sync event the better. A discrete ball contact or a visible clap gives you sub-frame accuracy.
+      </div>
+    `,
+  },
+  annotate: {
+    title: 'Annotate — How it works',
+    body: `
+      <div class="help-section">
+        <h3>Goal</h3>
+        <p>Scrub or play through the synced videos and log every ball touch and the contact surface. The frame counter at the bottom-left shows the synced frame across all cameras.</p>
+      </div>
+      <div class="help-section">
+        <h3>Logging a touch</h3>
+        <ol class="help-steps">
+          <li data-n="1">Pause on the frame of contact (use <strong>← →</strong> for fine control).</li>
+          <li data-n="2">Select a surface (Foot / Head / Arm / Torso / Other) — or skip and assign it later.</li>
+          <li data-n="3">Press <strong>T</strong> or click <strong>Log Touch</strong>. The touch appears in the list on the right.</li>
+          <li data-n="4">If you chose <em>Other</em>, a comment box appears — type a description and press <strong>Enter</strong>.</li>
+        </ol>
+      </div>
+      <div class="help-section">
+        <h3>Editing a logged touch</h3>
+        <p>Click any row in the touch list to <strong>seek to that frame</strong> and select it for editing. Then click a surface button to assign or change it. The row is highlighted in blue while selected.</p>
+      </div>
+      <div class="help-section">
+        <h3>Keyboard shortcuts</h3>
+        <table class="help-keys">
+          <tr><td><span class="kbd">Space</span></td><td>Play / Pause</td></tr>
+          <tr><td><span class="kbd">←</span> <span class="kbd">→</span></td><td>Step one frame back / forward</td></tr>
+          <tr><td><span class="kbd">↑</span> <span class="kbd">↓</span></td><td>Jump 1 second back / forward</td></tr>
+          <tr><td><span class="kbd">T</span></td><td>Log touch at current frame</td></tr>
+          <tr><td><span class="kbd">1</span>–<span class="kbd">5</span></td><td>Select surface: Foot · Head · Arm · Torso · Other</td></tr>
+          <tr><td><span class="kbd">H</span> or <span class="kbd">?</span></td><td>Open this help panel</td></tr>
+        </table>
+      </div>
+      <div class="help-section">
+        <h3>Exporting</h3>
+        <p>Click <strong>Export CSV</strong> when done. Columns: <code>frame</code>, <code>time_s</code>, <code>surface</code>, <code>comment</code>, plus one column per video showing that touch's local frame number.</p>
+      </div>
+      <div class="help-tip">
+        <strong>Tip:</strong> Use slow playback (0.25×) to spot contacts. Log first, assign surfaces after — it's faster than stopping for each one.
+      </div>
+    `,
+  },
+};
+
+function openHelp(page) {
+  const content = HELP_CONTENT[page];
+  $('help-title').textContent = content.title;
+  $('help-body').innerHTML    = content.body;
+  $('help-overlay').classList.add('show');
+}
+
+function closeHelp() {
+  $('help-overlay').classList.remove('show');
+}
+
+$('help-close').addEventListener('click', closeHelp);
+$('help-overlay').addEventListener('click', e => {
+  if (e.target === $('help-overlay')) closeHelp();
+});
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape' && $('help-overlay').classList.contains('show')) closeHelp();
+});
+
+$('sync-help-btn').addEventListener('click', () => openHelp('sync'));
+$('annotate-help-btn').addEventListener('click', () => openHelp('annotate'));
