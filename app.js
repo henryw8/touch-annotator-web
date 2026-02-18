@@ -484,6 +484,7 @@ function buildAnnotateScreen() {
   masterScrubber.step = (1 / masterFPS).toFixed(6);
 
   seekToMaster(0);
+  $('log-btn').disabled = false;
   renderAnnotations();
 }
 
