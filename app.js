@@ -33,6 +33,8 @@ function showScreen(name) {
 // videoItems: { file, name, objectUrl, el, fps, syncOffset }
 const videoItems = [];
 
+let pendingCsvFile = null;  // CSV uploaded for review mode
+
 let masterFPS    = 25;   // frames per second used for frame counter
 let masterTime   = 0;    // seconds relative to sync point (0 = sync moment)
 let masterMin    = 0;    // earliest valid masterTime
@@ -99,9 +101,16 @@ fileInput.addEventListener('change', () => {
 });
 
 function addFiles(files) {
+  const csvFiles   = files.filter(f => /\.csv$/i.test(f.name) || f.type === 'text/csv');
   const videoFiles = files.filter(
     f => f.type.startsWith('video/') || /\.(mp4|mov|mkv|webm|avi)$/i.test(f.name)
   );
+
+  if (csvFiles.length > 0) {
+    pendingCsvFile = csvFiles[0];
+    if (csvFiles.length > 1) showToast('Only one CSV at a time — loaded first');
+  }
+
   const slots = 4 - videoItems.length;
   const toAdd  = videoFiles.slice(0, slots);
   if (videoFiles.length > slots) {
@@ -115,6 +124,25 @@ function addFiles(files) {
 
 function renderFileList() {
   fileListEl.innerHTML = '';
+
+  // CSV entry (shown first, if present)
+  if (pendingCsvFile) {
+    const div = document.createElement('div');
+    div.className = 'file-item';
+    div.innerHTML = `
+      <span class="file-item-icon">📊</span>
+      <span class="file-item-name" title="${pendingCsvFile.name}">${pendingCsvFile.name}</span>
+      <span class="file-item-size">${fmtBytes(pendingCsvFile.size)}</span>
+      <button class="file-item-remove" id="csv-remove-btn" title="Remove CSV">✕</button>
+    `;
+    div.querySelector('#csv-remove-btn').addEventListener('click', () => {
+      pendingCsvFile = null;
+      renderFileList();
+    });
+    fileListEl.appendChild(div);
+  }
+
+  // Video entries
   videoItems.forEach((item, i) => {
     const div = document.createElement('div');
     div.className = 'file-item';
@@ -127,20 +155,26 @@ function renderFileList() {
     fileListEl.appendChild(div);
   });
 
-  fileListEl.querySelectorAll('.file-item-remove').forEach(btn => {
+  fileListEl.querySelectorAll('.file-item-remove[data-i]').forEach(btn => {
     btn.addEventListener('click', e => {
       const i = parseInt(e.currentTarget.dataset.i);
-      // Revoke object URL if already created
       if (videoItems[i].objectUrl) URL.revokeObjectURL(videoItems[i].objectUrl);
       videoItems.splice(i, 1);
       renderFileList();
     });
   });
 
-  uploadContinue.disabled = videoItems.length === 0;
+  const hasVideos = videoItems.length > 0;
+  uploadContinue.disabled = !hasVideos;
+  uploadContinue.textContent = (pendingCsvFile && hasVideos)
+    ? 'Load Annotations →'
+    : 'Continue to Sync →';
 }
 
-uploadContinue.addEventListener('click', startFpsDetection);
+uploadContinue.addEventListener('click', () => {
+  if (pendingCsvFile) startReviewSession();
+  else startFpsDetection();
+});
 
 // ═══════════════════════════════════════════════════════════
 // FPS DETECTION
@@ -820,6 +854,237 @@ function highlightCurrentRow() {
 }
 
 // ═══════════════════════════════════════════════════════════
+// REVIEW MODE — load videos + CSV to restore a session
+// ═══════════════════════════════════════════════════════════
+
+// Normalize a filename for fuzzy matching: lowercase, strip extension, collapse separators
+function normalizeName(name) {
+  return name.toLowerCase().replace(/\.[^.]+$/, '').replace(/[_\s-]+/g, ' ').trim();
+}
+
+// Parse a single CSV row, handling double-quoted fields
+function parseCsvRow(line) {
+  const result = [];
+  let cur = '';
+  let inQuote = false;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (ch === '"') {
+      inQuote = !inQuote;
+    } else if (ch === ',' && !inQuote) {
+      result.push(cur);
+      cur = '';
+    } else {
+      cur += ch;
+    }
+  }
+  result.push(cur);
+  return result;
+}
+
+// Parse the CSV text into structured data.
+// Returns: { meta, videoCols, annotations, perVideoFrames } or null on hard failure.
+function parseReviewCsv(text) {
+  const lines = text.split(/\r?\n/);
+
+  let meta = null;
+  let headers = null;
+  const dataLines = [];
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    if (trimmed.startsWith('#meta ')) {
+      try { meta = JSON.parse(trimmed.slice(6)); } catch { /* ignore bad meta */ }
+    } else if (trimmed.startsWith('#')) {
+      continue;  // other comment lines
+    } else if (!headers) {
+      headers = parseCsvRow(trimmed);
+    } else {
+      dataLines.push(trimmed);
+    }
+  }
+
+  if (!headers) return null;
+
+  const colFrame   = headers.indexOf('frame');
+  const colTime    = headers.indexOf('time_s');
+  const colSurface = headers.indexOf('surface');
+  const colComment = headers.indexOf('comment');
+
+  if (colFrame < 0 || colTime < 0) return null;
+
+  // Find per-video frame columns: frame_N_<name>
+  const videoCols = headers
+    .map((h, idx) => { const m = h.match(/^frame_(\d+)_(.+)$/); return m ? { idx, n: parseInt(m[1]), name: m[2] } : null; })
+    .filter(Boolean)
+    .sort((a, b) => a.n - b.n);
+
+  const annotations   = [];
+  const perVideoFrames = [];  // parallel array of per-video frame values for each annotation
+
+  for (const line of dataLines) {
+    const cols = parseCsvRow(line);
+    const frame   = parseInt(cols[colFrame]);
+    const time    = parseFloat(cols[colTime]);
+    if (isNaN(frame) || isNaN(time)) continue;
+
+    const surface = (colSurface >= 0 ? cols[colSurface] : '') || null;
+    const comment = (colComment >= 0 ? cols[colComment] : '') || '';
+
+    annotations.push({ frame, time, surface, comment });
+    perVideoFrames.push(videoCols.map(vc => parseInt(cols[vc.idx])));
+  }
+
+  return { meta, videoCols, annotations, perVideoFrames };
+}
+
+// Match metaVideos (from #meta) to videoItems by name. Sets fps + syncOffset.
+// Returns true on success, false on unrecoverable mismatch.
+function applyMetaToVideos(metaVideos) {
+  for (const mv of metaVideos) {
+    const mvNorm = normalizeName(mv.name);
+    let match = videoItems.find(v => normalizeName(v.name) === mvNorm);
+    if (!match) {
+      match = videoItems.find(v => {
+        const vn = normalizeName(v.name);
+        return vn.includes(mvNorm) || mvNorm.includes(vn);
+      });
+    }
+    if (!match) {
+      showToast(`Could not match "${mv.name}" from CSV to any uploaded video`);
+      return false;
+    }
+    match.fps        = mv.fps;
+    match.syncOffset = mv.syncOffset;
+  }
+
+  // Any videoItem not matched gets a fallback (0 offset, 25 fps)
+  for (const item of videoItems) {
+    if (item.fps === null) {
+      item.fps        = 25;
+      item.syncOffset = 0;
+      showToast(`No sync info for "${item.name}" — defaulting to offset 0`);
+    }
+  }
+  return true;
+}
+
+// Fallback for CSVs without #meta: derive sync offsets from per-video frame columns.
+// Requires fps to already be detected and stored on each videoItem.
+function deriveSyncOffsetsFromCsv(parsed) {
+  if (parsed.videoCols.length === 0) {
+    // No per-video columns — assume all offsets are 0
+    videoItems.forEach(v => { v.syncOffset = 0; });
+    return true;
+  }
+
+  if (parsed.videoCols.length !== videoItems.length) {
+    showToast(`CSV has ${parsed.videoCols.length} video column(s) but ${videoItems.length} video(s) uploaded`);
+    return false;
+  }
+
+  // Match CSV column names to videoItems (by fuzzy name)
+  const mapping = [];  // mapping[csvColArrayIdx] = videoItemIdx
+  for (let ci = 0; ci < parsed.videoCols.length; ci++) {
+    const colNorm = normalizeName(parsed.videoCols[ci].name);
+    let idx = videoItems.findIndex(v => normalizeName(v.name) === colNorm);
+    if (idx < 0) idx = videoItems.findIndex(v => { const vn = normalizeName(v.name); return vn.includes(colNorm) || colNorm.includes(vn); });
+    if (idx < 0) {
+      showToast(`Could not match video column "${parsed.videoCols[ci].name}" — upload files with matching names`);
+      return false;
+    }
+    mapping[ci] = idx;
+  }
+
+  // Accumulate offset estimates across all annotations, then take the median
+  const offsetBuckets = videoItems.map(() => []);
+  for (let r = 0; r < parsed.annotations.length; r++) {
+    const ann    = parsed.annotations[r];
+    const frames = parsed.perVideoFrames[r];
+    for (let ci = 0; ci < parsed.videoCols.length; ci++) {
+      const fv  = frames[ci];
+      const vi  = mapping[ci];
+      const fps = videoItems[vi].fps;
+      if (!isNaN(fv) && fps > 0) {
+        offsetBuckets[vi].push(fv / fps - ann.time);
+      }
+    }
+  }
+
+  for (let i = 0; i < videoItems.length; i++) {
+    const vals = offsetBuckets[i].sort((a, b) => a - b);
+    videoItems[i].syncOffset = vals.length ? vals[Math.floor(vals.length / 2)] : 0;
+  }
+  return true;
+}
+
+async function startReviewSession() {
+  let csvText;
+  try {
+    csvText = await pendingCsvFile.text();
+  } catch {
+    showToast('Could not read CSV file');
+    return;
+  }
+
+  const parsed = parseReviewCsv(csvText);
+  if (!parsed) {
+    showToast('Could not parse CSV — check the file format');
+    return;
+  }
+  if (parsed.annotations.length === 0) {
+    showToast('CSV contains no annotation rows');
+    return;
+  }
+
+  $('fps-overlay').classList.add('show');
+  $('fps-status').textContent = 'Preparing videos…';
+
+  // Create video elements + wait for metadata (duration etc.)
+  for (const item of videoItems) {
+    if (!item.objectUrl) item.objectUrl = URL.createObjectURL(item.file);
+    if (!item.el) {
+      const video = document.createElement('video');
+      video.src        = item.objectUrl;
+      video.preload    = 'auto';
+      video.muted      = true;
+      video.playsInline = true;
+      video.controls   = false;
+      item.el = video;
+      await waitForMetadata(video);
+    }
+  }
+
+  let ok;
+  if (parsed.meta && Array.isArray(parsed.meta.videos)) {
+    // New-format CSV: sync info embedded — no FPS detection needed
+    $('fps-status').textContent = 'Restoring sync from CSV…';
+    ok = applyMetaToVideos(parsed.meta.videos);
+  } else {
+    // Old-format CSV: detect FPS then derive offsets from per-video frame columns
+    showToast('CSV has no sync metadata — detecting FPS to approximate sync');
+    for (let i = 0; i < videoItems.length; i++) {
+      $('fps-status').textContent = `Detecting FPS — video ${i + 1} / ${videoItems.length}…`;
+      videoItems[i].fps = await detectFPS(videoItems[i].el);
+      $('fps-status').textContent = `Video ${i + 1}: ${videoItems[i].fps} fps ✓`;
+      await sleep(350);
+    }
+    ok = deriveSyncOffsetsFromCsv(parsed);
+  }
+
+  $('fps-overlay').classList.remove('show');
+  if (!ok) return;
+
+  masterFPS   = videoItems[0].fps;
+  annotations = parsed.annotations;
+
+  buildAnnotateScreen();
+  showScreen('annotate');
+  showToast(`Loaded ${annotations.length} touch${annotations.length !== 1 ? 'es' : ''} from CSV`);
+}
+
+// ═══════════════════════════════════════════════════════════
 // CSV EXPORT
 // ═══════════════════════════════════════════════════════════
 
@@ -847,8 +1112,18 @@ $('export-csv').addEventListener('click', () => {
     return [a.frame, a.time.toFixed(6), a.surface ?? '', comment, ...perVideoFrames];
   });
 
+  // Prepend sync metadata so the CSV can be reloaded to restore the session
+  const metaObj = {
+    videos: videoItems.map(item => ({
+      name: item.name,
+      syncOffset: item.syncOffset,
+      fps: item.fps,
+    })),
+  };
+  const metaLine = '#meta ' + JSON.stringify(metaObj);
+
   const rows = [headers, ...dataRows];
-  const csv  = rows.map(r => r.join(',')).join('\r\n');
+  const csv  = metaLine + '\r\n' + rows.map(r => r.join(',')).join('\r\n');
   const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
   const url  = URL.createObjectURL(blob);
 
