@@ -53,6 +53,10 @@ const drawingData    = new Map(); // videoIdx → {elements[], selectedIdx, canv
 let lineStartPoint   = null;     // {x,y} in 0-1 coords for in-progress line
 let lineStartVideoIdx = null;    // which video the in-progress line is on
 
+// Zoom/pan state per video
+const zoomStates = new Map(); // videoIdx → { scale, panX, panY, container }
+let activePan    = null;      // { videoIdx, startX, startY, startPanX, startPanY, cell }
+
 // Per-video sync state (parallel to videoItems)
 const syncStates = [];  // { isSet: bool }
 let lastActiveSyncIdx = 0; // which sync panel receives keyboard events
@@ -509,11 +513,18 @@ function buildAnnotateScreen() {
     canvas.className = 'draw-overlay';
     drawingData.set(idx, { elements: [], selectedIdx: -1, canvas, ctx: null });
 
-    cell.appendChild(item.el);
-    cell.appendChild(canvas);
+    // Zoom container wraps video + canvas so transforms apply to both
+    const zoomContainer = document.createElement('div');
+    zoomContainer.className = 'video-zoom-container';
+    zoomContainer.appendChild(item.el);
+    zoomContainer.appendChild(canvas);
+
+    cell.appendChild(zoomContainer);
     cell.appendChild(label);
     cell.appendChild(fpsBadge);
     videoGrid.appendChild(cell);
+
+    zoomStates.set(idx, { scale: 1, panX: 0, panY: 0, container: zoomContainer });
   });
 
   // Build drawing toolbar (inserted before video-grid)
@@ -544,6 +555,9 @@ function buildAnnotateScreen() {
 
   // Init canvases + ResizeObserver
   initDrawingCanvases();
+
+  // Init zoom/pan events
+  setupZoomEvents();
 
   // ── Compute master time range ──
   // masterTime = 0 at sync moment; negatives go back to start of earliest video.
@@ -1238,6 +1252,7 @@ document.addEventListener('keydown', e => {
     case '3': selectSurface('arm');   break;
     case '4': selectSurface('torso'); break;
     case '5': selectSurface('other'); break;
+    case '0': resetAllZoom();         break;
     case '?':
     case 'h':
     case 'H':
@@ -1305,9 +1320,9 @@ function initDrawingCanvases() {
 }
 
 function sizeCanvas(canvas) {
-  const rect = canvas.parentElement.getBoundingClientRect();
-  canvas.width = rect.width;
-  canvas.height = rect.height;
+  const cell = canvas.closest('.video-cell');
+  canvas.width = cell.clientWidth;
+  canvas.height = cell.clientHeight;
 }
 
 function toggleDrawingMode(forceState) {
@@ -1331,6 +1346,12 @@ function toggleDrawingMode(forceState) {
   // Toggle canvas pointer events
   drawingData.forEach(data => {
     data.canvas.classList.toggle('active', drawingMode);
+  });
+
+  // Update zoom cursors
+  zoomStates.forEach(state => {
+    const cell = state.container.parentElement;
+    cell.style.cursor = (!drawingMode && state.scale > 1) ? 'grab' : '';
   });
 
   redrawAllCanvases();
@@ -1653,6 +1674,120 @@ function drawLinePreview(ctx, canvas, start, end) {
 $('btn-draw').addEventListener('click', () => toggleDrawingMode());
 
 // ═══════════════════════════════════════════════════════════
+// ZOOM & PAN
+// ═══════════════════════════════════════════════════════════
+
+function setupZoomEvents() {
+  const cells = document.querySelectorAll('#video-grid .video-cell');
+  cells.forEach((cell, idx) => {
+    // Scroll wheel to zoom toward cursor
+    cell.addEventListener('wheel', e => {
+      e.preventDefault();
+      const state = zoomStates.get(idx);
+      if (!state) return;
+
+      const cellRect = cell.getBoundingClientRect();
+      const mx = e.clientX - cellRect.left;
+      const my = e.clientY - cellRect.top;
+
+      const oldScale = state.scale;
+      const factor = e.deltaY > 0 ? 0.9 : 1.1;
+      const newScale = Math.max(1, Math.min(8, oldScale * factor));
+      if (newScale === oldScale) return;
+
+      // Keep point under cursor fixed
+      const cx = (mx - state.panX) / oldScale;
+      const cy = (my - state.panY) / oldScale;
+      state.panX = mx - cx * newScale;
+      state.panY = my - cy * newScale;
+      state.scale = newScale;
+
+      clampPan(state, cellRect.width, cellRect.height);
+      applyZoom(idx);
+    }, { passive: false });
+
+    // Mousedown to start pan (only when zoomed and not drawing)
+    cell.addEventListener('mousedown', e => {
+      if (drawingMode) return;
+      const state = zoomStates.get(idx);
+      if (!state || state.scale <= 1) return;
+
+      activePan = {
+        videoIdx: idx,
+        startX: e.clientX,
+        startY: e.clientY,
+        startPanX: state.panX,
+        startPanY: state.panY,
+        cell
+      };
+      cell.style.cursor = 'grabbing';
+      e.preventDefault();
+    });
+
+    // Double-click to reset zoom
+    cell.addEventListener('dblclick', e => {
+      if (drawingMode) return;
+      const state = zoomStates.get(idx);
+      if (!state || state.scale === 1) return;
+      state.scale = 1;
+      state.panX = 0;
+      state.panY = 0;
+      applyZoom(idx);
+      e.preventDefault();
+    });
+  });
+}
+
+// Global pan move/up handlers (always present, no-op when activePan is null)
+document.addEventListener('mousemove', e => {
+  if (!activePan) return;
+  const state = zoomStates.get(activePan.videoIdx);
+  if (!state) return;
+
+  state.panX = activePan.startPanX + (e.clientX - activePan.startX);
+  state.panY = activePan.startPanY + (e.clientY - activePan.startY);
+
+  const cellRect = activePan.cell.getBoundingClientRect();
+  clampPan(state, cellRect.width, cellRect.height);
+  applyZoom(activePan.videoIdx);
+});
+
+document.addEventListener('mouseup', () => {
+  if (!activePan) return;
+  const state = zoomStates.get(activePan.videoIdx);
+  activePan.cell.style.cursor = (state && state.scale > 1) ? 'grab' : '';
+  activePan = null;
+});
+
+function clampPan(state, cellW, cellH) {
+  state.panX = Math.max(cellW * (1 - state.scale), Math.min(0, state.panX));
+  state.panY = Math.max(cellH * (1 - state.scale), Math.min(0, state.panY));
+}
+
+function applyZoom(videoIdx) {
+  const state = zoomStates.get(videoIdx);
+  if (!state) return;
+  state.container.style.transform = state.scale === 1
+    ? ''
+    : `translate(${state.panX}px, ${state.panY}px) scale(${state.scale})`;
+
+  // Cursor: grab when zoomed and not drawing
+  const cell = state.container.parentElement;
+  if (!activePan || activePan.videoIdx !== videoIdx) {
+    cell.style.cursor = (!drawingMode && state.scale > 1) ? 'grab' : '';
+  }
+}
+
+function resetAllZoom() {
+  zoomStates.forEach((state, idx) => {
+    state.scale = 1;
+    state.panX = 0;
+    state.panY = 0;
+    applyZoom(idx);
+  });
+}
+
+// ═══════════════════════════════════════════════════════════
 // HELP MODAL
 // ═══════════════════════════════════════════════════════════
 
@@ -1729,6 +1864,15 @@ const HELP_CONTENT = {
           <tr><td><span class="kbd">Esc</span></td><td>Cancel line / deselect / exit drawing</td></tr>
         </table>
         <p style="margin-top:6px;">Click near a drawn element to select it (highlighted with glow). Drawings persist across frame changes.</p>
+      </div>
+      <div class="help-section">
+        <h3>Zoom &amp; Pan</h3>
+        <table class="help-keys">
+          <tr><td>Scroll wheel</td><td>Zoom in/out on video (zooms toward cursor)</td></tr>
+          <tr><td>Drag</td><td>Pan when zoomed in (exit draw mode first)</td></tr>
+          <tr><td>Double-click</td><td>Reset zoom on that video</td></tr>
+          <tr><td><span class="kbd">0</span></td><td>Reset zoom on all videos</td></tr>
+        </table>
       </div>
       <div class="help-section">
         <h3>Exporting</h3>

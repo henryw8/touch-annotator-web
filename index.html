@@ -218,6 +218,11 @@
     .video-grid.count-4 { grid-template-columns: 1fr 1fr; grid-template-rows: 1fr 1fr; }
 
     .video-cell { position: relative; background: #000; border: 1px solid #1a1a1a; overflow: hidden; }
+    .video-zoom-container {
+      width: 100%; height: 100%;
+      position: relative;
+      transform-origin: 0 0;
+    }
     .video-cell video { width: 100%; height: 100%; object-fit: contain; display: block; }
     .video-cell-label {
       position: absolute; top: 6px; left: 8px;
