@@ -52,6 +52,8 @@ let drawToolMode     = 'free'; // 'free' | 'line'
 const drawingData    = new Map(); // videoIdx → {elements[], selectedIdx, canvas, ctx}
 let lineStartPoint   = null;     // {x,y} in 0-1 coords for in-progress line
 let lineStartVideoIdx = null;    // which video the in-progress line is on
+let drawColor        = '#4a9eff'; // current drawing color
+let lineAngle        = null;      // degrees (null = free angle)
 
 // Zoom/pan state per video
 const zoomStates = new Map(); // videoIdx → { scale, panX, panY, container }
@@ -538,6 +540,20 @@ function buildAnnotateScreen() {
     <button class="btn btn-sm" data-draw-tool="line">Line</button>
     <button class="btn btn-sm" data-draw-tool="erase">Eraser</button>
     <div class="draw-sep"></div>
+    <span class="draw-colors">
+      <span class="draw-swatch active" data-color="#4a9eff" style="background:#4a9eff;" title="Blue"></span>
+      <span class="draw-swatch" data-color="#4aff8a" style="background:#4aff8a;" title="Green"></span>
+      <span class="draw-swatch" data-color="#ff4a6a" style="background:#ff4a6a;" title="Red"></span>
+      <span class="draw-swatch" data-color="#ffcc44" style="background:#ffcc44;" title="Yellow"></span>
+      <span class="draw-swatch" data-color="#ffffff" style="background:#ffffff;" title="White"></span>
+    </span>
+    <div class="draw-sep"></div>
+    <span class="draw-angle-wrap" id="draw-angle-wrap" style="display:none;">
+      <label style="font-size:11px;color:var(--text-dim);">Angle</label>
+      <input type="number" id="draw-angle-input" class="draw-angle-input" placeholder="—" min="0" max="360" step="1">
+      <span style="font-size:11px;color:var(--text-dim);">°</span>
+      <div class="draw-sep"></div>
+    </span>
     <button class="btn btn-sm" id="draw-clear-all">Clear All</button>
     <button class="btn btn-sm" id="draw-close">✕</button>
   `;
@@ -549,6 +565,17 @@ function buildAnnotateScreen() {
   // Toolbar events
   drawToolbar.querySelectorAll('[data-draw-tool]').forEach(btn => {
     btn.addEventListener('click', () => setDrawTool(btn.dataset.drawTool));
+  });
+  drawToolbar.querySelectorAll('.draw-swatch').forEach(sw => {
+    sw.addEventListener('click', () => {
+      drawToolbar.querySelectorAll('.draw-swatch').forEach(s => s.classList.remove('active'));
+      sw.classList.add('active');
+      drawColor = sw.dataset.color;
+    });
+  });
+  document.getElementById('draw-angle-input').addEventListener('input', e => {
+    const val = e.target.value.trim();
+    lineAngle = val === '' ? null : parseFloat(val);
   });
   document.getElementById('draw-clear-all').addEventListener('click', clearAllDrawings);
   document.getElementById('draw-close').addEventListener('click', () => toggleDrawingMode(false));
@@ -1374,6 +1401,10 @@ function setDrawTool(tool) {
     data.canvas.classList.toggle('erase', tool === 'erase');
   });
 
+  // Show angle input only for line tool
+  const angleWrap = document.getElementById('draw-angle-wrap');
+  if (angleWrap) angleWrap.style.display = tool === 'line' ? '' : 'none';
+
   redrawAllCanvases();
 }
 
@@ -1457,7 +1488,7 @@ function setupCanvasEvents(canvas, videoIdx) {
     // Rubber-band preview for line tool
     if (drawToolMode === 'line' && lineStartPoint && lineStartVideoIdx === videoIdx) {
       redrawCanvas(videoIdx);
-      drawLinePreview(drawingData.get(videoIdx).ctx, canvas, lineStartPoint, norm);
+      drawLinePreview(drawingData.get(videoIdx).ctx, canvas, lineStartPoint, snapLineEnd(lineStartPoint, norm));
     }
   });
 
@@ -1471,7 +1502,7 @@ function setupCanvasEvents(canvas, videoIdx) {
     if (drawToolMode === 'free') {
       if (isDragging && currentStroke && currentStroke.length > 1) {
         // Finalize freehand stroke
-        data.elements.push({ type: 'freehand', points: currentStroke });
+        data.elements.push({ type: 'freehand', points: currentStroke, color: drawColor });
         data.selectedIdx = -1;
       } else if (!isDragging) {
         // Click — try to select
@@ -1496,8 +1527,9 @@ function setupCanvasEvents(canvas, videoIdx) {
         lineStartPoint = norm;
         lineStartVideoIdx = videoIdx;
       } else {
-        // Second click — finalize line
-        data.elements.push({ type: 'line', start: lineStartPoint, end: norm });
+        // Second click — finalize line (snap angle if set)
+        const endPt = snapLineEnd(lineStartPoint, norm);
+        data.elements.push({ type: 'line', start: lineStartPoint, end: endPt, color: drawColor });
         data.selectedIdx = -1;
         lineStartPoint = null;
         lineStartVideoIdx = null;
@@ -1515,7 +1547,7 @@ function setupCanvasEvents(canvas, videoIdx) {
       // Finalize stroke on leave
       const data = drawingData.get(videoIdx);
       if (currentStroke.length > 1) {
-        data.elements.push({ type: 'freehand', points: currentStroke });
+        data.elements.push({ type: 'freehand', points: currentStroke, color: drawColor });
         data.selectedIdx = -1;
       }
       currentStroke = null;
@@ -1589,31 +1621,32 @@ function redrawCanvas(videoIdx) {
 
   elements.forEach((el, i) => {
     const isSelected = i === selectedIdx;
+    const color = el.color || '#4a9eff';
     if (el.type === 'freehand') {
-      drawFreehandElement(ctx, canvas, el.points, isSelected);
+      drawFreehandElement(ctx, canvas, el.points, isSelected, color);
     } else if (el.type === 'line') {
-      drawLineElement(ctx, canvas, el.start, el.end, isSelected);
+      drawLineElement(ctx, canvas, el.start, el.end, isSelected, color);
     }
   });
 
   // Draw start-point dot for in-progress line
   if (lineStartPoint && lineStartVideoIdx === videoIdx) {
-    ctx.fillStyle = '#4aff8a';
+    ctx.fillStyle = drawColor;
     ctx.beginPath();
     ctx.arc(lineStartPoint.x * canvas.width, lineStartPoint.y * canvas.height, 4, 0, Math.PI * 2);
     ctx.fill();
   }
 }
 
-function drawFreehandElement(ctx, canvas, points, selected) {
+function drawFreehandElement(ctx, canvas, points, selected, color) {
   if (points.length < 2) return;
   ctx.save();
-  ctx.strokeStyle = '#4a9eff';
+  ctx.strokeStyle = color;
   ctx.lineWidth = selected ? 4 : 2;
   ctx.lineCap = 'round';
   ctx.lineJoin = 'round';
   if (selected) {
-    ctx.shadowColor = '#4a9eff';
+    ctx.shadowColor = color;
     ctx.shadowBlur = 8;
   }
   ctx.beginPath();
@@ -1625,13 +1658,13 @@ function drawFreehandElement(ctx, canvas, points, selected) {
   ctx.restore();
 }
 
-function drawLineElement(ctx, canvas, start, end, selected) {
+function drawLineElement(ctx, canvas, start, end, selected, color) {
   ctx.save();
-  ctx.strokeStyle = '#4aff8a';
+  ctx.strokeStyle = color;
   ctx.lineWidth = selected ? 4 : 2;
   ctx.lineCap = 'round';
   if (selected) {
-    ctx.shadowColor = '#4aff8a';
+    ctx.shadowColor = color;
     ctx.shadowBlur = 8;
   }
   ctx.beginPath();
@@ -1644,7 +1677,8 @@ function drawLineElement(ctx, canvas, start, end, selected) {
 function drawFreehandPreview(ctx, canvas, points) {
   if (points.length < 2) return;
   ctx.save();
-  ctx.strokeStyle = 'rgba(74,158,255,0.6)';
+  ctx.strokeStyle = drawColor;
+  ctx.globalAlpha = 0.6;
   ctx.lineWidth = 2;
   ctx.lineCap = 'round';
   ctx.lineJoin = 'round';
@@ -1659,7 +1693,8 @@ function drawFreehandPreview(ctx, canvas, points) {
 
 function drawLinePreview(ctx, canvas, start, end) {
   ctx.save();
-  ctx.strokeStyle = 'rgba(74,255,138,0.5)';
+  ctx.strokeStyle = drawColor;
+  ctx.globalAlpha = 0.5;
   ctx.lineWidth = 2;
   ctx.lineCap = 'round';
   ctx.setLineDash([6, 4]);
@@ -1668,6 +1703,15 @@ function drawLinePreview(ctx, canvas, start, end) {
   ctx.lineTo(end.x * canvas.width, end.y * canvas.height);
   ctx.stroke();
   ctx.restore();
+}
+
+function snapLineEnd(start, end) {
+  if (lineAngle === null) return end;
+  const rad = lineAngle * Math.PI / 180;
+  const dx = end.x - start.x, dy = end.y - start.y;
+  const len = Math.sqrt(dx * dx + dy * dy);
+  if (len === 0) return end;
+  return { x: start.x + Math.cos(rad) * len, y: start.y + Math.sin(rad) * len };
 }
 
 // Draw button event

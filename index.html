@@ -272,6 +272,22 @@
       background: var(--border);
       margin: 0 4px;
     }
+    .draw-colors { display: flex; gap: 4px; align-items: center; }
+    .draw-swatch {
+      width: 18px; height: 18px; border-radius: 50%;
+      border: 2px solid transparent; cursor: pointer;
+      transition: border-color 0.15s;
+    }
+    .draw-swatch:hover { border-color: rgba(255,255,255,0.4); }
+    .draw-swatch.active { border-color: #fff; }
+    .draw-angle-input {
+      width: 42px; padding: 2px 4px;
+      background: var(--surface2); border: 1px solid var(--border);
+      border-radius: 4px; color: var(--text); font-size: 11px;
+      text-align: center; outline: none;
+    }
+    .draw-angle-input:focus { border-color: var(--accent); }
+    .draw-angle-wrap { display: flex; align-items: center; gap: 4px; }
 
     /* Main column (grid + transport) */
     .annotate-main { display: flex; flex-direction: column; flex: 1; min-width: 0; overflow: hidden; }
