@@ -525,6 +525,7 @@ function buildAnnotateScreen() {
   drawToolbar.innerHTML = `
     <button class="btn btn-sm tool-active" data-draw-tool="free">Freehand</button>
     <button class="btn btn-sm" data-draw-tool="line">Line</button>
+    <button class="btn btn-sm" data-draw-tool="erase">Eraser</button>
     <div class="draw-sep"></div>
     <button class="btn btn-sm" id="draw-clear-all">Clear All</button>
     <button class="btn btn-sm" id="draw-close">✕</button>
@@ -1256,6 +1257,10 @@ document.addEventListener('keydown', e => {
     case 'L':
       if (drawingMode) setDrawTool('line');
       break;
+    case 'e':
+    case 'E':
+      if (drawingMode) setDrawTool('erase');
+      break;
     case 'Delete':
     case 'Backspace':
       if (drawingMode) deleteSelectedDrawing();
@@ -1342,6 +1347,12 @@ function setDrawTool(tool) {
   toolbar.querySelectorAll('[data-draw-tool]').forEach(btn => {
     btn.classList.toggle('tool-active', btn.dataset.drawTool === tool);
   });
+
+  // Update cursor style on canvases
+  drawingData.forEach(data => {
+    data.canvas.classList.toggle('erase', tool === 'erase');
+  });
+
   redrawAllCanvases();
 }
 
@@ -1447,6 +1458,17 @@ function setupCanvasEvents(canvas, videoIdx) {
       }
     }
 
+    if (drawToolMode === 'erase' && !isDragging) {
+      // Click near an element to erase it
+      const threshold = 0.02;
+      let bestIdx = -1, bestDist = Infinity;
+      data.elements.forEach((el, i) => {
+        const d = distToElement(el, norm);
+        if (d < threshold && d < bestDist) { bestDist = d; bestIdx = i; }
+      });
+      if (bestIdx >= 0) data.elements.splice(bestIdx, 1);
+    }
+
     if (drawToolMode === 'line' && !isDragging) {
       if (!lineStartPoint || lineStartVideoIdx !== videoIdx) {
         // First click — set start
@@ -1535,6 +1557,13 @@ function redrawCanvas(videoIdx) {
   const data = drawingData.get(videoIdx);
   if (!data) return;
   const { ctx, canvas, elements, selectedIdx } = data;
+
+  // Hide canvas when not needed — avoids browser compositing issues with video
+  const hasContent = elements.length > 0 || (lineStartPoint && lineStartVideoIdx === videoIdx);
+  const needsCanvas = drawingMode || hasContent;
+  canvas.style.display = needsCanvas ? '' : 'none';
+  if (!needsCanvas) return;
+
   ctx.clearRect(0, 0, canvas.width, canvas.height);
 
   elements.forEach((el, i) => {
@@ -1695,6 +1724,7 @@ const HELP_CONTENT = {
           <tr><td><span class="kbd">D</span></td><td>Toggle drawing mode on/off</td></tr>
           <tr><td><span class="kbd">F</span></td><td>Switch to freehand tool</td></tr>
           <tr><td><span class="kbd">L</span></td><td>Switch to straight line tool</td></tr>
+          <tr><td><span class="kbd">E</span></td><td>Switch to eraser tool (click elements to erase)</td></tr>
           <tr><td><span class="kbd">Del</span> / <span class="kbd">⌫</span></td><td>Delete selected drawing</td></tr>
           <tr><td><span class="kbd">Esc</span></td><td>Cancel line / deselect / exit drawing</td></tr>
         </table>
