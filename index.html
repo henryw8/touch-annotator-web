@@ -230,6 +230,41 @@
       padding: 2px 6px; border-radius: 4px; color: #777; pointer-events: none;
     }
 
+    /* ── Drawing overlay ── */
+    .draw-overlay {
+      position: absolute; inset: 0;
+      pointer-events: none;
+      z-index: 5;
+    }
+    .draw-overlay.active {
+      pointer-events: auto;
+      cursor: crosshair;
+    }
+    .draw-toolbar {
+      display: none;
+      position: absolute; top: 8px; left: 50%;
+      transform: translateX(-50%);
+      z-index: 20;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 4px 8px;
+      gap: 4px;
+      align-items: center;
+      user-select: none;
+    }
+    .draw-toolbar.visible { display: flex; }
+    .draw-toolbar .btn.tool-active {
+      background: var(--accent-dim);
+      border-color: var(--accent);
+      color: #9ad0ff;
+    }
+    .draw-toolbar .draw-sep {
+      width: 1px; height: 20px;
+      background: var(--border);
+      margin: 0 4px;
+    }
+
     /* Main column (grid + transport) */
     .annotate-main { display: flex; flex-direction: column; flex: 1; min-width: 0; overflow: hidden; }
 
@@ -545,6 +580,7 @@
               <option value="2">2×</option>
             </select>
           </div>
+          <button class="btn btn-sm" id="btn-draw" title="Toggle drawing mode (D)" style="margin-left:4px;">✏ Draw</button>
           <button class="help-btn" id="annotate-help-btn" title="Help" style="margin-left:4px;">? Help</button>
           <button class="btn btn-sm" id="btn-re-sync" title="Go back to sync screen" style="margin-left:4px;">Re-sync</button>
         </div>

@@ -46,6 +46,13 @@ let annotations          = [];   // { frame, time, surface }
 let selectedSurface      = null;
 let editingAnnotationIdx = null; // index in annotations[] being edited post-hoc
 
+// Drawing overlay state
+let drawingMode      = false;
+let drawToolMode     = 'free'; // 'free' | 'line'
+const drawingData    = new Map(); // videoIdx → {elements[], selectedIdx, canvas, ctx}
+let lineStartPoint   = null;     // {x,y} in 0-1 coords for in-progress line
+let lineStartVideoIdx = null;    // which video the in-progress line is on
+
 // Per-video sync state (parallel to videoItems)
 const syncStates = [];  // { isSet: bool }
 let lastActiveSyncIdx = 0; // which sync panel receives keyboard events
@@ -479,7 +486,9 @@ function buildAnnotateScreen() {
   const count = videoItems.length;
   videoGrid.className = `video-grid count-${count}`;
 
-  videoItems.forEach(item => {
+  drawingData.clear();
+
+  videoItems.forEach((item, idx) => {
     const cell = document.createElement('div');
     cell.className = 'video-cell';
 
@@ -495,11 +504,45 @@ function buildAnnotateScreen() {
     item.el.style.cssText = 'width:100%;height:100%;object-fit:contain;display:block;';
     item.el.controls = false;
 
+    // Drawing canvas overlay
+    const canvas = document.createElement('canvas');
+    canvas.className = 'draw-overlay';
+    drawingData.set(idx, { elements: [], selectedIdx: -1, canvas, ctx: null });
+
     cell.appendChild(item.el);
+    cell.appendChild(canvas);
     cell.appendChild(label);
     cell.appendChild(fpsBadge);
     videoGrid.appendChild(cell);
   });
+
+  // Build drawing toolbar (inserted before video-grid)
+  let drawToolbar = document.getElementById('draw-toolbar');
+  if (drawToolbar) drawToolbar.remove();
+  drawToolbar = document.createElement('div');
+  drawToolbar.id = 'draw-toolbar';
+  drawToolbar.className = 'draw-toolbar';
+  drawToolbar.innerHTML = `
+    <button class="btn btn-sm tool-active" data-draw-tool="free">Freehand</button>
+    <button class="btn btn-sm" data-draw-tool="line">Line</button>
+    <div class="draw-sep"></div>
+    <button class="btn btn-sm" id="draw-clear-all">Clear All</button>
+    <button class="btn btn-sm" id="draw-close">✕</button>
+  `;
+  // Place toolbar relative to .annotate-main
+  const annotateMain = videoGrid.parentElement;
+  annotateMain.style.position = 'relative';
+  annotateMain.insertBefore(drawToolbar, videoGrid);
+
+  // Toolbar events
+  drawToolbar.querySelectorAll('[data-draw-tool]').forEach(btn => {
+    btn.addEventListener('click', () => setDrawTool(btn.dataset.drawTool));
+  });
+  document.getElementById('draw-clear-all').addEventListener('click', clearAllDrawings);
+  document.getElementById('draw-close').addEventListener('click', () => toggleDrawingMode(false));
+
+  // Init canvases + ResizeObserver
+  initDrawingCanvases();
 
   // ── Compute master time range ──
   // masterTime = 0 at sync moment; negatives go back to start of earliest video.
@@ -1199,8 +1242,386 @@ document.addEventListener('keydown', e => {
     case 'H':
       openHelp('annotate');
       break;
+
+    // Drawing mode shortcuts
+    case 'd':
+    case 'D':
+      toggleDrawingMode();
+      break;
+    case 'f':
+    case 'F':
+      if (drawingMode) setDrawTool('free');
+      break;
+    case 'l':
+    case 'L':
+      if (drawingMode) setDrawTool('line');
+      break;
+    case 'Delete':
+    case 'Backspace':
+      if (drawingMode) deleteSelectedDrawing();
+      break;
+    case 'Escape':
+      if (drawingMode) {
+        e.preventDefault();
+        if (lineStartPoint) {
+          lineStartPoint = null;
+          lineStartVideoIdx = null;
+          redrawAllCanvases();
+        } else if (deselectAllDrawings()) {
+          // Deselected something
+        } else {
+          toggleDrawingMode(false);
+        }
+      }
+      break;
   }
 });
+
+// ═══════════════════════════════════════════════════════════
+// DRAWING OVERLAY
+// ═══════════════════════════════════════════════════════════
+
+function initDrawingCanvases() {
+  drawingData.forEach((data, idx) => {
+    const canvas = data.canvas;
+    data.ctx = canvas.getContext('2d');
+    sizeCanvas(canvas);
+    setupCanvasEvents(canvas, idx);
+  });
+
+  // ResizeObserver to keep canvas pixel size in sync
+  const ro = new ResizeObserver(() => {
+    drawingData.forEach(data => {
+      sizeCanvas(data.canvas);
+    });
+    redrawAllCanvases();
+  });
+  ro.observe(document.getElementById('video-grid'));
+}
+
+function sizeCanvas(canvas) {
+  const rect = canvas.parentElement.getBoundingClientRect();
+  canvas.width = rect.width;
+  canvas.height = rect.height;
+}
+
+function toggleDrawingMode(forceState) {
+  drawingMode = forceState !== undefined ? forceState : !drawingMode;
+
+  // Toggle button state
+  const btn = document.getElementById('btn-draw');
+  if (drawingMode) {
+    btn.classList.add('btn-primary');
+  } else {
+    btn.classList.remove('btn-primary');
+    lineStartPoint = null;
+    lineStartVideoIdx = null;
+    deselectAllDrawings();
+  }
+
+  // Toggle toolbar visibility
+  const toolbar = document.getElementById('draw-toolbar');
+  if (toolbar) toolbar.classList.toggle('visible', drawingMode);
+
+  // Toggle canvas pointer events
+  drawingData.forEach(data => {
+    data.canvas.classList.toggle('active', drawingMode);
+  });
+
+  redrawAllCanvases();
+}
+
+function setDrawTool(tool) {
+  drawToolMode = tool;
+  // Cancel any in-progress line when switching tools
+  lineStartPoint = null;
+  lineStartVideoIdx = null;
+
+  const toolbar = document.getElementById('draw-toolbar');
+  if (!toolbar) return;
+  toolbar.querySelectorAll('[data-draw-tool]').forEach(btn => {
+    btn.classList.toggle('tool-active', btn.dataset.drawTool === tool);
+  });
+  redrawAllCanvases();
+}
+
+function clearAllDrawings() {
+  drawingData.forEach(data => {
+    data.elements = [];
+    data.selectedIdx = -1;
+  });
+  lineStartPoint = null;
+  lineStartVideoIdx = null;
+  redrawAllCanvases();
+  showToast('All drawings cleared');
+}
+
+function deleteSelectedDrawing() {
+  for (const [, data] of drawingData) {
+    if (data.selectedIdx >= 0 && data.selectedIdx < data.elements.length) {
+      data.elements.splice(data.selectedIdx, 1);
+      data.selectedIdx = -1;
+      redrawAllCanvases();
+      return;
+    }
+  }
+}
+
+function deselectAllDrawings() {
+  let hadSelection = false;
+  drawingData.forEach(data => {
+    if (data.selectedIdx >= 0) hadSelection = true;
+    data.selectedIdx = -1;
+  });
+  if (hadSelection) redrawAllCanvases();
+  return hadSelection;
+}
+
+// ── Canvas mouse/pointer events ──
+
+function setupCanvasEvents(canvas, videoIdx) {
+  let isDragging = false;
+  let dragStartPx = null; // {x,y} in pixels
+  let currentStroke = null; // freehand points being drawn
+
+  canvas.addEventListener('mousedown', e => {
+    if (!drawingMode) return;
+    const rect = canvas.getBoundingClientRect();
+    const px = { x: e.clientX - rect.left, y: e.clientY - rect.top };
+    const norm = { x: px.x / rect.width, y: px.y / rect.height };
+
+    dragStartPx = px;
+    isDragging = false;
+    currentStroke = null;
+
+    if (drawToolMode === 'free') {
+      currentStroke = [norm];
+    }
+    // For line tool, mousedown does nothing special — we use click logic
+  });
+
+  canvas.addEventListener('mousemove', e => {
+    if (!drawingMode) return;
+    const rect = canvas.getBoundingClientRect();
+    const px = { x: e.clientX - rect.left, y: e.clientY - rect.top };
+    const norm = { x: px.x / rect.width, y: px.y / rect.height };
+
+    // Check if we've moved enough to count as a drag
+    if (dragStartPx) {
+      const dx = px.x - dragStartPx.x;
+      const dy = px.y - dragStartPx.y;
+      if (Math.sqrt(dx * dx + dy * dy) > 5) {
+        isDragging = true;
+      }
+    }
+
+    if (drawToolMode === 'free' && isDragging && currentStroke) {
+      currentStroke.push(norm);
+      // Draw preview
+      redrawCanvas(videoIdx);
+      drawFreehandPreview(drawingData.get(videoIdx).ctx, canvas, currentStroke);
+    }
+
+    // Rubber-band preview for line tool
+    if (drawToolMode === 'line' && lineStartPoint && lineStartVideoIdx === videoIdx) {
+      redrawCanvas(videoIdx);
+      drawLinePreview(drawingData.get(videoIdx).ctx, canvas, lineStartPoint, norm);
+    }
+  });
+
+  canvas.addEventListener('mouseup', e => {
+    if (!drawingMode) return;
+    const rect = canvas.getBoundingClientRect();
+    const px = { x: e.clientX - rect.left, y: e.clientY - rect.top };
+    const norm = { x: px.x / rect.width, y: px.y / rect.height };
+    const data = drawingData.get(videoIdx);
+
+    if (drawToolMode === 'free') {
+      if (isDragging && currentStroke && currentStroke.length > 1) {
+        // Finalize freehand stroke
+        data.elements.push({ type: 'freehand', points: currentStroke });
+        data.selectedIdx = -1;
+      } else if (!isDragging) {
+        // Click — try to select
+        trySelectElement(videoIdx, norm);
+      }
+    }
+
+    if (drawToolMode === 'line' && !isDragging) {
+      if (!lineStartPoint || lineStartVideoIdx !== videoIdx) {
+        // First click — set start
+        lineStartPoint = norm;
+        lineStartVideoIdx = videoIdx;
+      } else {
+        // Second click — finalize line
+        data.elements.push({ type: 'line', start: lineStartPoint, end: norm });
+        data.selectedIdx = -1;
+        lineStartPoint = null;
+        lineStartVideoIdx = null;
+      }
+    }
+
+    currentStroke = null;
+    dragStartPx = null;
+    isDragging = false;
+    redrawAllCanvases();
+  });
+
+  canvas.addEventListener('mouseleave', () => {
+    if (currentStroke && isDragging && drawToolMode === 'free') {
+      // Finalize stroke on leave
+      const data = drawingData.get(videoIdx);
+      if (currentStroke.length > 1) {
+        data.elements.push({ type: 'freehand', points: currentStroke });
+        data.selectedIdx = -1;
+      }
+      currentStroke = null;
+      dragStartPx = null;
+      isDragging = false;
+      redrawAllCanvases();
+    }
+  });
+}
+
+function trySelectElement(videoIdx, clickNorm) {
+  const data = drawingData.get(videoIdx);
+  const threshold = 0.02; // 2% of canvas dimension
+  let bestIdx = -1;
+  let bestDist = Infinity;
+
+  data.elements.forEach((el, i) => {
+    const dist = distToElement(el, clickNorm);
+    if (dist < threshold && dist < bestDist) {
+      bestDist = dist;
+      bestIdx = i;
+    }
+  });
+
+  // Deselect all first
+  drawingData.forEach(d => d.selectedIdx = -1);
+  data.selectedIdx = bestIdx;
+}
+
+function distToElement(el, pt) {
+  if (el.type === 'line') {
+    return distPointToSegment(pt, el.start, el.end);
+  }
+  // Freehand: min distance to any segment
+  let minD = Infinity;
+  for (let i = 0; i < el.points.length - 1; i++) {
+    const d = distPointToSegment(pt, el.points[i], el.points[i + 1]);
+    if (d < minD) minD = d;
+  }
+  return minD;
+}
+
+function distPointToSegment(p, a, b) {
+  const dx = b.x - a.x, dy = b.y - a.y;
+  const lenSq = dx * dx + dy * dy;
+  if (lenSq === 0) return Math.sqrt((p.x - a.x) ** 2 + (p.y - a.y) ** 2);
+  let t = ((p.x - a.x) * dx + (p.y - a.y) * dy) / lenSq;
+  t = Math.max(0, Math.min(1, t));
+  const proj = { x: a.x + t * dx, y: a.y + t * dy };
+  return Math.sqrt((p.x - proj.x) ** 2 + (p.y - proj.y) ** 2);
+}
+
+// ── Rendering ──
+
+function redrawAllCanvases() {
+  drawingData.forEach((_, idx) => redrawCanvas(idx));
+}
+
+function redrawCanvas(videoIdx) {
+  const data = drawingData.get(videoIdx);
+  if (!data) return;
+  const { ctx, canvas, elements, selectedIdx } = data;
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+  elements.forEach((el, i) => {
+    const isSelected = i === selectedIdx;
+    if (el.type === 'freehand') {
+      drawFreehandElement(ctx, canvas, el.points, isSelected);
+    } else if (el.type === 'line') {
+      drawLineElement(ctx, canvas, el.start, el.end, isSelected);
+    }
+  });
+
+  // Draw start-point dot for in-progress line
+  if (lineStartPoint && lineStartVideoIdx === videoIdx) {
+    ctx.fillStyle = '#4aff8a';
+    ctx.beginPath();
+    ctx.arc(lineStartPoint.x * canvas.width, lineStartPoint.y * canvas.height, 4, 0, Math.PI * 2);
+    ctx.fill();
+  }
+}
+
+function drawFreehandElement(ctx, canvas, points, selected) {
+  if (points.length < 2) return;
+  ctx.save();
+  ctx.strokeStyle = '#4a9eff';
+  ctx.lineWidth = selected ? 4 : 2;
+  ctx.lineCap = 'round';
+  ctx.lineJoin = 'round';
+  if (selected) {
+    ctx.shadowColor = '#4a9eff';
+    ctx.shadowBlur = 8;
+  }
+  ctx.beginPath();
+  ctx.moveTo(points[0].x * canvas.width, points[0].y * canvas.height);
+  for (let i = 1; i < points.length; i++) {
+    ctx.lineTo(points[i].x * canvas.width, points[i].y * canvas.height);
+  }
+  ctx.stroke();
+  ctx.restore();
+}
+
+function drawLineElement(ctx, canvas, start, end, selected) {
+  ctx.save();
+  ctx.strokeStyle = '#4aff8a';
+  ctx.lineWidth = selected ? 4 : 2;
+  ctx.lineCap = 'round';
+  if (selected) {
+    ctx.shadowColor = '#4aff8a';
+    ctx.shadowBlur = 8;
+  }
+  ctx.beginPath();
+  ctx.moveTo(start.x * canvas.width, start.y * canvas.height);
+  ctx.lineTo(end.x * canvas.width, end.y * canvas.height);
+  ctx.stroke();
+  ctx.restore();
+}
+
+function drawFreehandPreview(ctx, canvas, points) {
+  if (points.length < 2) return;
+  ctx.save();
+  ctx.strokeStyle = 'rgba(74,158,255,0.6)';
+  ctx.lineWidth = 2;
+  ctx.lineCap = 'round';
+  ctx.lineJoin = 'round';
+  ctx.beginPath();
+  ctx.moveTo(points[0].x * canvas.width, points[0].y * canvas.height);
+  for (let i = 1; i < points.length; i++) {
+    ctx.lineTo(points[i].x * canvas.width, points[i].y * canvas.height);
+  }
+  ctx.stroke();
+  ctx.restore();
+}
+
+function drawLinePreview(ctx, canvas, start, end) {
+  ctx.save();
+  ctx.strokeStyle = 'rgba(74,255,138,0.5)';
+  ctx.lineWidth = 2;
+  ctx.lineCap = 'round';
+  ctx.setLineDash([6, 4]);
+  ctx.beginPath();
+  ctx.moveTo(start.x * canvas.width, start.y * canvas.height);
+  ctx.lineTo(end.x * canvas.width, end.y * canvas.height);
+  ctx.stroke();
+  ctx.restore();
+}
+
+// Draw button event
+$('btn-draw').addEventListener('click', () => toggleDrawingMode());
 
 // ═══════════════════════════════════════════════════════════
 // HELP MODAL
@@ -1267,6 +1688,17 @@ const HELP_CONTENT = {
           <tr><td><span class="kbd">1</span>–<span class="kbd">5</span></td><td>Select surface: Foot · Head · Arm · Torso · Other</td></tr>
           <tr><td><span class="kbd">H</span> or <span class="kbd">?</span></td><td>Open this help panel</td></tr>
         </table>
+      </div>
+      <div class="help-section">
+        <h3>Drawing overlay</h3>
+        <table class="help-keys">
+          <tr><td><span class="kbd">D</span></td><td>Toggle drawing mode on/off</td></tr>
+          <tr><td><span class="kbd">F</span></td><td>Switch to freehand tool</td></tr>
+          <tr><td><span class="kbd">L</span></td><td>Switch to straight line tool</td></tr>
+          <tr><td><span class="kbd">Del</span> / <span class="kbd">⌫</span></td><td>Delete selected drawing</td></tr>
+          <tr><td><span class="kbd">Esc</span></td><td>Cancel line / deselect / exit drawing</td></tr>
+        </table>
+        <p style="margin-top:6px;">Click near a drawn element to select it (highlighted with glow). Drawings persist across frame changes.</p>
       </div>
       <div class="help-section">
         <h3>Exporting</h3>
