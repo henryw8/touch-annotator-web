@@ -41,6 +41,7 @@ let masterMin    = 0;    // earliest valid masterTime
 let masterMax    = 60;   // latest valid masterTime
 let isPlaying    = false;
 let rafId        = null;
+let frameAccurateTimer = null;
 
 let annotations          = [];   // { frame, time, surface }
 let selectedSurface      = null;
@@ -252,37 +253,35 @@ function waitForMetadata(video) {
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-function detectFPS(video) {
+function sampleFPS(video, playbackRate, sampleFrames, timeoutMs) {
   return new Promise(resolve => {
-    // Feature-detect requestVideoFrameCallback
-    if (!('requestVideoFrameCallback' in HTMLVideoElement.prototype)) {
-      resolve(25);
-      return;
-    }
-
-    const SAMPLE_FRAMES = 60;
-    let count      = 0;
+    let count = 0;
     let startMedia = null;
+    let settled = false;
     const savedTime = video.currentTime;
 
-    // Start a bit into the video (avoid black frames / buffering edge)
     const startAt = Math.min(2, (video.duration || 10) * 0.05);
     video.currentTime = startAt;
-    video.playbackRate = 1;
+    video.playbackRate = playbackRate;
+
+    const finish = (fps) => {
+      if (settled) return;
+      settled = true;
+      video.pause();
+      video.currentTime = savedTime;
+      resolve(fps);
+    };
 
     const onFrame = (now, meta) => {
+      if (settled) return;
       if (startMedia === null) {
         startMedia = meta.mediaTime;
         count = 0;
       } else {
         count++;
-        if (count >= SAMPLE_FRAMES) {
+        if (count >= sampleFrames) {
           const elapsed = meta.mediaTime - startMedia;
-          const fps = elapsed > 0 ? Math.round(count / elapsed) : 25;
-          video.pause();
-          video.currentTime = savedTime;
-          // Clamp to sane fps values
-          resolve(Math.max(10, Math.min(120, fps)));
+          finish(elapsed > 0 ? Math.round(count / elapsed) : 0);
           return;
         }
       }
@@ -290,17 +289,37 @@ function detectFPS(video) {
     };
 
     video.requestVideoFrameCallback(onFrame);
-    video.play().catch(() => resolve(25));
+    video.play().catch(() => finish(0));
 
-    // Safety timeout — if detection stalls, fall back to 25
-    setTimeout(() => {
-      if (!video.paused) {
-        video.pause();
-        video.currentTime = savedTime;
-      }
-      resolve(25);
-    }, 10000);
+    setTimeout(() => finish(0), timeoutMs);
   });
+}
+
+// Display refresh rates — when Pass 1 returns one of these, it could be
+// display-capped (e.g. 60 from a 1000fps video). Otherwise we trust Pass 1.
+const DISPLAY_LIKE_FPS = new Set([48, 50, 59, 60, 72, 75, 90, 120, 144, 240]);
+
+async function detectFPS(video) {
+  if (!('requestVideoFrameCallback' in HTMLVideoElement.prototype)) {
+    return 25;
+  }
+
+  const pass1 = await sampleFPS(video, 1, 60, 10000);
+  if (pass1 > 240) {
+    return Math.max(10, Math.min(10000, pass1));
+  }
+  if (!DISPLAY_LIKE_FPS.has(pass1)) {
+    // 24, 30, etc. — not a display rate, so Pass 1 is trustworthy
+    return Math.max(10, Math.min(10000, pass1));
+  }
+
+  // Pass 2: Pass 1 could be display-capped. Slow playback to get true rate.
+  const pass2 = await sampleFPS(video, 0.05, 15, 15000);
+  if (pass2 > 0) {
+    return Math.max(10, Math.min(10000, pass2));
+  }
+
+  return pass1 > 0 ? Math.max(10, Math.min(10000, pass1)) : 25;
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -331,7 +350,7 @@ function buildSyncScreen() {
         <button class="btn btn-sm btn-icon" data-action="prev" title="−1 frame (←)">◀</button>
         <button class="btn btn-sm btn-icon" data-action="next" title="+1 frame (→)">▶▶</button>
         <input type="range" class="sync-scrubber"
-               min="0" max="${item.el.duration || 9999}" step="0.001" value="0">
+               min="0" max="${item.el.duration || 9999}" step="${(1 / item.fps).toFixed(6)}" value="0">
         <span class="sync-time">0.000 s</span>
       </div>
       <div class="sync-controls" style="flex-wrap:wrap;gap:8px;">
@@ -339,8 +358,8 @@ function buildSyncScreen() {
         <span class="sync-fps-row">
           <span class="fps-badge">${item.fps} fps</span>
           <input type="number" class="btn btn-sm fps-override"
-                 min="1" max="120" value="${item.fps}"
-                 title="Override detected FPS" style="width:56px;text-align:center;">
+                 min="1" max="10000" value="${item.fps}"
+                 title="Override detected FPS" style="width:72px;text-align:center;">
         </span>
       </div>
       <div class="sync-kbd-hint">← → frame step · Space play/pause</div>
@@ -412,9 +431,10 @@ function buildSyncScreen() {
     // FPS override
     fpsInput.addEventListener('change', () => {
       const val = parseInt(fpsInput.value);
-      if (val >= 1 && val <= 120) {
+      if (val >= 1 && val <= 10000) {
         item.fps = val;
         fpsBadge.textContent = val + ' fps';
+        scrubber.step = (1 / val).toFixed(6);
         if (i === 0) masterFPS = val;
       }
     });
@@ -493,6 +513,7 @@ const videoGrid     = $('video-grid');
 const frameDisplay  = $('frame-display');
 const timeDisplay   = $('time-display');
 const masterScrubber = $('master-scrubber');
+const frameAccurateModeInput = $('frame-accurate-mode');
 const btnPlay  = $('btn-play');
 const btnPrev  = $('btn-prev');
 const btnNext  = $('btn-next');
@@ -736,6 +757,27 @@ function startPlayback() {
   btnPlay.title = 'Pause (Space)';
 
   const rate = parseFloat($('playback-rate').value);
+  const frameAccurateMode = !!(frameAccurateModeInput && frameAccurateModeInput.checked);
+
+  if (frameAccurateMode) {
+    // In frame-accurate mode, advance exactly one frame per tick. If the browser
+    // cannot sustain the requested rate, playback slows down instead of skipping.
+    videoItems.forEach(item => item.el.pause());
+    const frameStep = 1 / masterFPS;
+    const intervalMs = Math.max(4, 1000 / (masterFPS * rate));
+    frameAccurateTimer = setInterval(() => {
+      if (!isPlaying) return;
+      const nextTime = masterTime + frameStep;
+      if (nextTime >= masterMax) {
+        pausePlayback();
+        seekToMaster(masterMax);
+        return;
+      }
+      seekToMaster(nextTime);
+    }, intervalMs);
+    return;
+  }
+
   videoItems.forEach(item => {
     const t = Math.max(0, Math.min(item.el.duration, masterTime + item.syncOffset));
     item.el.currentTime    = t;
@@ -753,6 +795,10 @@ function pausePlayback() {
   btnPlay.title = 'Play (Space)';
   cancelAnimationFrame(rafId);
   rafId = null;
+  if (frameAccurateTimer !== null) {
+    clearInterval(frameAccurateTimer);
+    frameAccurateTimer = null;
+  }
   videoItems.forEach(item => item.el.pause());
 }
 
@@ -809,10 +855,27 @@ masterScrubber.addEventListener('input', () => {
 
 $('playback-rate').addEventListener('change', function () {
   if (isPlaying) {
-    const rate = parseFloat(this.value);
-    videoItems.forEach(item => { item.el.playbackRate = rate; });
+    const frameAccurateMode = !!(frameAccurateModeInput && frameAccurateModeInput.checked);
+    if (frameAccurateMode) {
+      // Restart interval to apply new frame cadence.
+      pausePlayback();
+      startPlayback();
+    } else {
+      const rate = parseFloat(this.value);
+      videoItems.forEach(item => { item.el.playbackRate = rate; });
+    }
   }
 });
+
+if (frameAccurateModeInput) {
+  frameAccurateModeInput.addEventListener('change', () => {
+    if (isPlaying) {
+      // Switch playback engine immediately when toggled.
+      pausePlayback();
+      startPlayback();
+    }
+  });
+}
 
 $('btn-re-sync').addEventListener('click', () => {
   pausePlayback();

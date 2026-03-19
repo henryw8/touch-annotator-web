@@ -632,12 +632,18 @@
           <div style="display:flex;align-items:center;gap:6px;margin-left:auto;">
             <span style="font-size:12px;color:var(--text-dim);">Speed</span>
             <select id="playback-rate" style="background:var(--surface2);border:1px solid var(--border);color:var(--text);border-radius:5px;padding:4px 6px;font-size:12px;cursor:pointer;">
+              <option value="0.05">0.05×</option>
+              <option value="0.1">0.1×</option>
               <option value="0.25">0.25×</option>
               <option value="0.5">0.5×</option>
               <option value="1" selected>1×</option>
               <option value="2">2×</option>
             </select>
           </div>
+          <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--text-dim);margin-left:4px;" title="Advance exactly one frame per tick; slower but avoids frame skipping on high-FPS videos.">
+            <input type="checkbox" id="frame-accurate-mode">
+            Frame-accurate
+          </label>
           <button class="btn btn-sm" id="btn-draw" title="Toggle drawing mode (D)" style="margin-left:4px;">✏ Draw</button>
           <button class="btn btn-sm" id="btn-calibrate" title="Toggle calibration mode (C)" style="margin-left:4px;">⊿ Calibrate</button>
           <button class="help-btn" id="annotate-help-btn" title="Help" style="margin-left:4px;">? Help</button>
