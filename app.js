@@ -42,6 +42,7 @@ let masterMax    = 60;   // latest valid masterTime
 let isPlaying    = false;
 let rafId        = null;
 let frameAccurateTimer = null;
+let realTimeFactor = 1;  // real_time_s = video_time_s * realTimeFactor
 
 let annotations          = [];   // { frame, time, surface }
 let selectedSurface      = null;
@@ -513,12 +514,17 @@ const videoGrid     = $('video-grid');
 const frameDisplay  = $('frame-display');
 const timeDisplay   = $('time-display');
 const masterScrubber = $('master-scrubber');
+const realTimeFactorInput = $('real-time-factor');
 const frameAccurateModeInput = $('frame-accurate-mode');
 const btnPlay  = $('btn-play');
 const btnPrev  = $('btn-prev');
 const btnNext  = $('btn-next');
 const btnStart = $('btn-start');
 const btnEnd   = $('btn-end');
+
+function toRealTime(videoTime) {
+  return videoTime * realTimeFactor;
+}
 
 function buildAnnotateScreen() {
   videoGrid.innerHTML = '';
@@ -740,7 +746,7 @@ function seekToMaster(t) {
 function updateTransportUI() {
   const frame = Math.round(masterTime * masterFPS);
   frameDisplay.textContent = `Frame ${frame}`;
-  timeDisplay.textContent  = masterTime.toFixed(3) + ' s';
+  timeDisplay.textContent  = `${masterTime.toFixed(3)} s  (real ${toRealTime(masterTime).toFixed(3)} s)`;
   masterScrubber.value     = masterTime;
   highlightCurrentRow();
 }
@@ -1047,7 +1053,7 @@ function renderAnnotations() {
     row.dataset.frame = ann.frame;
     row.innerHTML = `
       <span class="ann-frame">${ann.frame}</span>
-      <span class="ann-time">${ann.time.toFixed(3)}s</span>
+      <span class="ann-time">${ann.time.toFixed(3)}s (real ${toRealTime(ann.time).toFixed(3)}s)</span>
       <span class="ann-surface">${surfaceLabel}${heightLabel}</span>
       <button class="ann-del" title="Delete">✕</button>
     `;
@@ -1347,6 +1353,16 @@ async function startReviewSession() {
   $('fps-overlay').classList.remove('show');
   if (!ok) return;
 
+  const metaFactor = parsed.meta ? parseFloat(parsed.meta.realTimeFactor) : NaN;
+  if (Number.isFinite(metaFactor) && metaFactor > 0) {
+    realTimeFactor = metaFactor;
+  } else {
+    realTimeFactor = 1;
+  }
+  if (realTimeFactorInput) {
+    realTimeFactorInput.value = String(realTimeFactor);
+  }
+
   masterFPS   = videoItems[0].fps;
   annotations = parsed.annotations;
 
@@ -1368,7 +1384,7 @@ $('export-csv').addEventListener('click', () => {
     return `frame_${i + 1}_${base}`;
   });
 
-  const headers = ['frame', 'time_s', 'surface', 'comment', 'height', 'height_unit', ...videoHeaders];
+  const headers = ['frame', 'time_s', 'real_time_s', 'surface', 'comment', 'height', 'height_unit', ...videoHeaders];
 
   const dataRows = annotations.map(a => {
     const comment = (a.comment && a.comment.includes(','))
@@ -1380,7 +1396,16 @@ $('export-csv').addEventListener('click', () => {
       return Math.round(localTime * item.fps);
     });
 
-    return [a.frame, a.time.toFixed(6), a.surface ?? '', comment, a.height ?? '', a.heightUnit ?? '', ...perVideoFrames];
+    return [
+      a.frame,
+      a.time.toFixed(6),
+      toRealTime(a.time).toFixed(6),
+      a.surface ?? '',
+      comment,
+      a.height ?? '',
+      a.heightUnit ?? '',
+      ...perVideoFrames,
+    ];
   });
 
   // Prepend sync metadata so the CSV can be reloaded to restore the session
@@ -1390,6 +1415,7 @@ $('export-csv').addEventListener('click', () => {
       syncOffset: item.syncOffset,
       fps: item.fps,
     })),
+    realTimeFactor,
   };
   const metaLine = '#meta ' + JSON.stringify(metaObj);
 
@@ -1406,6 +1432,20 @@ $('export-csv').addEventListener('click', () => {
 
   showToast(`Exported ${annotations.length} touch${annotations.length !== 1 ? 'es' : ''}`);
 });
+
+if (realTimeFactorInput) {
+  realTimeFactorInput.addEventListener('change', () => {
+    const val = parseFloat(realTimeFactorInput.value);
+    if (Number.isFinite(val) && val > 0) {
+      realTimeFactor = val;
+    } else {
+      realTimeFactor = 1;
+      realTimeFactorInput.value = '1';
+    }
+    updateTransportUI();
+    renderAnnotations();
+  });
+}
 
 $('clear-all').addEventListener('click', () => {
   if (annotations.length === 0) return;
