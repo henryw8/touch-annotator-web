@@ -80,6 +80,7 @@ let trajectory           = [];         // [{ frame, masterTime, normCx, normCy, 
 let trackBusy            = false;      // true during auto-tracking
 let selectingGround      = false;      // true when waiting for ground click
 let trackScratchCanvas   = null;       // OffscreenCanvas for pixel extraction
+let trackDragStart       = null;       // {x, y, videoIdx} normalized — mousedown point for circle draw
 
 // Zoom/pan state per video
 const zoomStates = new Map(); // videoIdx → { scale, panX, panY, container }
@@ -726,7 +727,7 @@ function buildAnnotateScreen() {
   trackToolbar.id = 'track-toolbar';
   trackToolbar.className = 'draw-toolbar';  // reuse draw-toolbar styling
   trackToolbar.innerHTML = `
-    <span id="track-status" style="font-size:12px;color:var(--text-dim);">Click ball to initialize</span>
+    <span id="track-status" style="font-size:12px;color:var(--text-dim);">Drag from center to edge of ball</span>
     <div class="draw-sep"></div>
     <button class="btn btn-sm" id="track-set-ground" title="Click ground level on video (G)">Set Ground</button>
     <button class="btn btn-sm" id="track-forward" title="Batch track forward (F)">▶ Forward</button>
@@ -1838,6 +1839,10 @@ function setupCanvasEvents(canvas, videoIdx) {
     isDragging = false;
     currentStroke = null;
 
+    if (trackMode && !selectingGround) {
+      trackDragStart = { x: norm.x, y: norm.y, videoIdx };
+    }
+
     if (drawingMode && drawToolMode === 'free') {
       currentStroke = [norm];
     }
@@ -1856,6 +1861,32 @@ function setupCanvasEvents(canvas, videoIdx) {
       if (Math.sqrt(dx * dx + dy * dy) > 5) {
         isDragging = true;
       }
+    }
+
+    // Track mode circle preview while dragging
+    if (trackMode && isDragging && trackDragStart && trackDragStart.videoIdx === videoIdx) {
+      redrawCanvas(videoIdx);
+      const tCtx = drawingData.get(videoIdx).ctx;
+      const W = canvas.width, H = canvas.height;
+      const cxPx = trackDragStart.x * W;
+      const cyPx = trackDragStart.y * H;
+      const dx = norm.x * W - cxPx;
+      const dy = norm.y * H - cyPx;
+      const r = Math.sqrt(dx * dx + dy * dy);
+      tCtx.save();
+      tCtx.strokeStyle = '#ff4a6a';
+      tCtx.lineWidth = 2;
+      tCtx.setLineDash([4, 3]);
+      tCtx.beginPath();
+      tCtx.arc(cxPx, cyPx, r, 0, Math.PI * 2);
+      tCtx.stroke();
+      // Top marker
+      tCtx.fillStyle = '#ff4a6a';
+      tCtx.beginPath();
+      tCtx.arc(cxPx, cyPx - r, 4, 0, Math.PI * 2);
+      tCtx.fill();
+      tCtx.restore();
+      return;
     }
 
     // Measurement mode rubber-band
@@ -1903,9 +1934,14 @@ function setupCanvasEvents(canvas, videoIdx) {
     const px = { x: e.clientX - rect.left, y: e.clientY - rect.top };
     const norm = { x: px.x / rect.width, y: px.y / rect.height };
 
-    // Handle tracking clicks
-    if (trackMode && !isDragging) {
-      handleTrackClick(videoIdx, norm);
+    // Handle tracking: drag = draw circle prior, click = ground select
+    if (trackMode) {
+      if (isDragging && trackDragStart && trackDragStart.videoIdx === videoIdx) {
+        handleTrackDrag(videoIdx, trackDragStart, norm);
+      } else if (!isDragging) {
+        handleTrackClick(videoIdx, norm);
+      }
+      trackDragStart = null;
       currentStroke = null;
       dragStartPx = null;
       isDragging = false;
@@ -2356,11 +2392,11 @@ function updateTrackStatus() {
   if (!el) return;
   if (trackBusy) return;
   if (trackBallRadius > 0 && trajectory.length > 0) {
-    el.textContent = `${trajectory.length} pts (r=${trackBallRadius}px) — scrub or batch track`;
+    el.textContent = `${trajectory.length} pts (r=${Math.round(trackBallRadius)}px) — scrub or batch track`;
   } else if (trackBallRadius > 0) {
-    el.textContent = `Ball detected (r=${trackBallRadius}px) — scrub to track`;
+    el.textContent = `Ball set (r=${Math.round(trackBallRadius)}px) — scrub to track`;
   } else {
-    el.textContent = 'Click on the ball to initialize';
+    el.textContent = 'Drag from center to edge of ball';
   }
 }
 
@@ -2504,50 +2540,30 @@ function seekAndCapture(videoEl, targetTime) {
   });
 }
 
-// ── Click handler ──
+// ── Drag handler: user draws circle as prior ──
 
-function handleTrackClick(videoIdx, norm) {
-  if (selectingGround) {
-    trackGroundY = norm.y;
-    selectingGround = false;
-    recomputeTrajectoryHeights();
-    redrawAllCanvases();
-    showToast(`Ground level set at y=${(norm.y * 100).toFixed(1)}%`);
-    return;
-  }
-
+function handleTrackDrag(videoIdx, start, end) {
   const videoEl = videoItems[videoIdx].el;
   const vw = videoEl.videoWidth;
   const vh = videoEl.videoHeight;
 
-  const scratch = ensureScratchCanvas(videoEl);
-  const sctx = scratch.getContext('2d');
-  sctx.drawImage(videoEl, 0, 0, vw, vh);
+  // Center = drag start, radius = distance to drag end (in video pixels)
+  const cxPx = start.x * vw;
+  const cyPx = start.y * vh;
+  const dx = (end.x - start.x) * vw;
+  const dy = (end.y - start.y) * vh;
+  const radiusPx = Math.sqrt(dx * dx + dy * dy);
 
-  const clickPx = { x: norm.x * vw, y: norm.y * vh };
+  if (radiusPx < 3) { showToast('Drag further to set ball size'); return; }
 
-  // Detect ball via radial intensity profile around click
-  const initHalf = 150;
-  const patch = extractGrayscalePatch(sctx, clickPx.x, clickPx.y, initHalf, vw, vh);
-  if (!patch) { showToast('Could not read video frame'); return; }
-
-  const localX = clickPx.x - patch.ox;
-  const localY = clickPx.y - patch.oy;
-  const det = detectBallRadial(patch.data, patch.w, patch.h, localX, localY);
-  if (!det) {
-    showToast('Could not detect the ball — try clicking on its center');
-    return;
-  }
-
-  trackBallRadius = det.radius;
-  trackLastCenter = { x: patch.ox + det.cx, y: patch.oy + det.cy };
+  trackBallRadius = radiusPx;
+  trackLastCenter = { x: cxPx, y: cyPx };
   trackVideoIdx = videoIdx;
 
-  const normCx = trackLastCenter.x / vw;
-  const normCy = trackLastCenter.y / vh;
-  const normTopY = (patch.oy + det.topY) / vh;
+  const normCx = start.x;
+  const normCy = start.y;
+  const normTopY = (cyPx - radiusPx) / vh;
 
-  // Add first trajectory point
   const frame = Math.round(masterTime * masterFPS);
   const pt = {
     frame,
@@ -2555,7 +2571,7 @@ function handleTrackClick(videoIdx, norm) {
     normCx,
     normCy,
     normTopY,
-    radiusPx: trackBallRadius,
+    radiusPx,
     heightM: computeTrackHeight(videoIdx, normCx, normTopY),
   };
   const existing = trajectory.findIndex(p => p.frame === frame);
@@ -2564,7 +2580,19 @@ function handleTrackClick(videoIdx, norm) {
 
   updateTrackStatus();
   redrawAllCanvases();
-  showToast(`Ball detected (r=${trackBallRadius}px) — scrub with arrow keys to track`);
+  showToast(`Ball set (r=${Math.round(radiusPx)}px) — scrub with arrow keys to track`);
+}
+
+// ── Click handler (ground selection only) ──
+
+function handleTrackClick(videoIdx, norm) {
+  if (selectingGround) {
+    trackGroundY = norm.y;
+    selectingGround = false;
+    recomputeTrajectoryHeights();
+    redrawAllCanvases();
+    showToast(`Ground level set at y=${(norm.y * 100).toFixed(1)}%`);
+  }
 }
 
 // ── Auto-detect on frame step ──
@@ -3073,7 +3101,7 @@ const HELP_CONTENT = {
         <ol class="help-steps">
           <li data-n="1">Calibrate a reference height first (press <strong>C</strong>).</li>
           <li data-n="2">Press <strong>B</strong> or click <strong>⊙ Track</strong> to enter tracking mode.</li>
-          <li data-n="3">Click the ball — circle detection finds its outline and radius.</li>
+          <li data-n="3"><strong>Drag</strong> from the ball's center to its edge — this draws the circle prior.</li>
           <li data-n="4">Scrub with <strong>← →</strong> arrow keys — the ball is auto-detected each frame.</li>
           <li data-n="5">Press <strong>G</strong> to set ground level for height measurement.</li>
           <li data-n="6">Use <strong>F</strong> / <strong>R</strong> for batch tracking forward/backward.</li>
@@ -3087,7 +3115,7 @@ const HELP_CONTENT = {
           <tr><td><span class="kbd">G</span></td><td>Set ground level</td></tr>
           <tr><td><span class="kbd">Esc</span></td><td>Stop tracking / exit track mode</td></tr>
         </table>
-        <p style="margin-top:6px;">Click the ball at any time to re-initialize detection. The trajectory tracks the <strong>top of the ball</strong> (center − radius) for accurate height measurement.</p>
+        <p style="margin-top:6px;">Drag on the ball at any time to re-initialize. The trajectory tracks the <strong>top of the ball</strong> (center − radius) for accurate height measurement.</p>
       </div>
       <div class="help-section">
         <h3>Zoom &amp; Pan</h3>
