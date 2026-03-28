@@ -72,11 +72,11 @@ let measureFirstClick    = null;      // {x, y, videoIdx} normalized
 // Ball trajectory tracking state
 let trackMode            = false;
 let trackVideoIdx        = null;       // which video is being tracked
-let trackTemplate        = null;       // { data: Float32Array, w, h } grayscale template patch
-let trackTemplateSize    = 40;         // half-size of template in pixels (80×80 patch)
-let trackSearchRadius    = 60;         // search window radius beyond template
+let trackBallRadius      = 0;          // detected ball radius in video pixels
+let trackLastCenter      = null;       // {x, y} last known center in video pixels
+let trackSearchRadius    = 80;         // search window radius beyond ball area
 let trackGroundY         = null;       // normalized Y coordinate of ground plane
-let trajectory           = [];         // [{ frame, masterTime, normX, normY, heightM }]
+let trajectory           = [];         // [{ frame, masterTime, normCx, normCy, normTopY, radiusPx, heightM }]
 let trackBusy            = false;      // true during auto-tracking
 let selectingGround      = false;      // true when waiting for ground click
 let trackScratchCanvas   = null;       // OffscreenCanvas for pixel extraction
@@ -561,6 +561,13 @@ function buildAnnotateScreen() {
     item.el.style.cssText = 'width:100%;height:100%;object-fit:contain;display:block;';
     item.el.controls = false;
 
+    // Auto-detect ball on seek when tracking is active
+    item.el.addEventListener('seeked', () => {
+      if (trackMode && !trackBusy && !isPlaying && trackBallRadius > 0 && trackVideoIdx === idx) {
+        autoDetectBall();
+      }
+    });
+
     // Drawing canvas overlay
     const canvas = document.createElement('canvas');
     canvas.className = 'draw-overlay';
@@ -719,20 +726,11 @@ function buildAnnotateScreen() {
   trackToolbar.id = 'track-toolbar';
   trackToolbar.className = 'draw-toolbar';  // reuse draw-toolbar styling
   trackToolbar.innerHTML = `
-    <span id="track-status" style="font-size:12px;color:var(--text-dim);">Click ball to set template</span>
-    <div class="draw-sep"></div>
-    <label style="font-size:11px;color:var(--text-dim);display:flex;align-items:center;gap:3px;">
-      Size <input type="number" id="track-tpl-size" value="${trackTemplateSize}" min="10" max="200" step="5"
-             style="width:48px;padding:3px 5px;background:var(--surface2);border:1px solid var(--border);border-radius:4px;color:var(--text);font-size:12px;">
-    </label>
-    <label style="font-size:11px;color:var(--text-dim);display:flex;align-items:center;gap:3px;">
-      Search <input type="number" id="track-search-radius" value="${trackSearchRadius}" min="20" max="300" step="10"
-               style="width:48px;padding:3px 5px;background:var(--surface2);border:1px solid var(--border);border-radius:4px;color:var(--text);font-size:12px;">
-    </label>
+    <span id="track-status" style="font-size:12px;color:var(--text-dim);">Click ball to initialize</span>
     <div class="draw-sep"></div>
     <button class="btn btn-sm" id="track-set-ground" title="Click ground level on video (G)">Set Ground</button>
-    <button class="btn btn-sm" id="track-forward" title="Track ball forward (F)">▶ Forward</button>
-    <button class="btn btn-sm" id="track-backward" title="Track ball backward (R)">◀ Backward</button>
+    <button class="btn btn-sm" id="track-forward" title="Batch track forward (F)">▶ Forward</button>
+    <button class="btn btn-sm" id="track-backward" title="Batch track backward (R)">◀ Backward</button>
     <div class="draw-sep"></div>
     <div class="track-progress" id="track-progress" style="display:none;">
       <div class="track-progress-bar" id="track-progress-bar"></div>
@@ -744,14 +742,6 @@ function buildAnnotateScreen() {
   `;
   annotateMain.insertBefore(trackToolbar, videoGrid);
 
-  document.getElementById('track-tpl-size').addEventListener('change', e => {
-    const val = parseInt(e.target.value);
-    if (val > 0) trackTemplateSize = val;
-  });
-  document.getElementById('track-search-radius').addEventListener('change', e => {
-    const val = parseInt(e.target.value);
-    if (val > 0) trackSearchRadius = val;
-  });
   document.getElementById('track-set-ground').addEventListener('click', () => {
     selectingGround = true;
     showToast('Click the ground level on the video');
@@ -763,7 +753,8 @@ function buildAnnotateScreen() {
   document.getElementById('track-clear').addEventListener('click', () => {
     if (trajectory.length === 0) { showToast('No trajectory to clear'); return; }
     trajectory = [];
-    trackTemplate = null;
+    trackBallRadius = 0;
+    trackLastCenter = null;
     trackGroundY = null;
     trackVideoIdx = null;
     updateTrackStatus();
@@ -1596,12 +1587,12 @@ document.addEventListener('keydown', e => {
       break;
     case 'f':
     case 'F':
-      if (trackMode && trackTemplate && !trackBusy) { trackInDirection('forward'); break; }
+      if (trackMode && trackBallRadius > 0 && !trackBusy) { trackInDirection('forward'); break; }
       if (drawingMode) setDrawTool('free');
       break;
     case 'r':
     case 'R':
-      if (trackMode && trackTemplate && !trackBusy) trackInDirection('backward');
+      if (trackMode && trackBallRadius > 0 && !trackBusy) trackInDirection('backward');
       break;
     case 'g':
     case 'G':
@@ -2363,11 +2354,13 @@ function toggleTrackMode(forceState) {
 function updateTrackStatus() {
   const el = document.getElementById('track-status');
   if (!el) return;
-  if (trackBusy) return; // status updated by tracking loop
-  if (trajectory.length === 0) {
-    el.textContent = trackTemplate ? 'Template set — click Forward/Backward' : 'Click ball to set template';
+  if (trackBusy) return;
+  if (trackBallRadius > 0 && trajectory.length > 0) {
+    el.textContent = `${trajectory.length} pts (r=${trackBallRadius}px) — scrub or batch track`;
+  } else if (trackBallRadius > 0) {
+    el.textContent = `Ball detected (r=${trackBallRadius}px) — scrub to track`;
   } else {
-    el.textContent = `${trajectory.length} points tracked`;
+    el.textContent = 'Click on the ball to initialize';
   }
 }
 
@@ -2398,63 +2391,122 @@ function extractGrayscalePatch(scratchCtx, cx, cy, halfSize, vw, vh) {
   return { data: gray, w, h, ox: x0, oy: y0 };
 }
 
-function computeNCC(template, tW, tH, search, sW, sH) {
-  // Pre-compute template stats
-  let tMean = 0;
-  for (let i = 0; i < template.length; i++) tMean += template[i];
-  tMean /= template.length;
+// ── Hough circle detection ──
 
-  let tVar = 0;
-  for (let i = 0; i < template.length; i++) {
-    const d = template[i] - tMean;
-    tVar += d * d;
+function sobelEdges(gray, w, h) {
+  const mag = new Float32Array(w * h);
+  const dirX = new Float32Array(w * h);
+  const dirY = new Float32Array(w * h);
+
+  for (let y = 1; y < h - 1; y++) {
+    for (let x = 1; x < w - 1; x++) {
+      const idx = y * w + x;
+      const gx = -gray[(y - 1) * w + (x - 1)] - 2 * gray[y * w + (x - 1)] - gray[(y + 1) * w + (x - 1)]
+               +  gray[(y - 1) * w + (x + 1)] + 2 * gray[y * w + (x + 1)] + gray[(y + 1) * w + (x + 1)];
+      const gy = -gray[(y - 1) * w + (x - 1)] - 2 * gray[(y - 1) * w + x] - gray[(y - 1) * w + (x + 1)]
+               +  gray[(y + 1) * w + (x - 1)] + 2 * gray[(y + 1) * w + x] + gray[(y + 1) * w + (x + 1)];
+
+      const m = Math.sqrt(gx * gx + gy * gy);
+      mag[idx] = m;
+      const len = m || 1;
+      dirX[idx] = gx / len;
+      dirY[idx] = gy / len;
+    }
   }
-  if (tVar < 1e-6) return { bestX: 0, bestY: 0, bestScore: 0 };
-  const tStd = Math.sqrt(tVar);
+  return { mag, dirX, dirY };
+}
 
-  let bestScore = -2;
-  let bestX = 0, bestY = 0;
+function houghCircleDetect(gray, w, h, rMin, rMax) {
+  const edges = sobelEdges(gray, w, h);
 
-  const maxTy = sH - tH;
-  const maxTx = sW - tW;
+  // Adaptive edge threshold: top 15% of edge magnitudes
+  const sorted = Array.from(edges.mag).sort((a, b) => b - a);
+  const threshold = sorted[Math.floor(sorted.length * 0.15)] || 30;
 
-  for (let sy = 0; sy <= maxTy; sy++) {
-    for (let sx = 0; sx <= maxTx; sx++) {
-      // Compute patch mean
-      let pMean = 0;
-      for (let ty = 0; ty < tH; ty++) {
-        const sRow = (sy + ty) * sW + sx;
-        for (let tx = 0; tx < tW; tx++) {
-          pMean += search[sRow + tx];
-        }
-      }
-      pMean /= template.length;
+  // Accumulator for center votes
+  const acc = new Int32Array(w * h);
 
-      // Compute NCC
-      let num = 0, pVar = 0;
-      for (let ty = 0; ty < tH; ty++) {
-        const sRow = (sy + ty) * sW + sx;
-        const tRow = ty * tW;
-        for (let tx = 0; tx < tW; tx++) {
-          const td = template[tRow + tx] - tMean;
-          const pd = search[sRow + tx] - pMean;
-          num += td * pd;
-          pVar += pd * pd;
-        }
-      }
+  for (let y = 1; y < h - 1; y++) {
+    for (let x = 1; x < w - 1; x++) {
+      const idx = y * w + x;
+      if (edges.mag[idx] < threshold) continue;
 
-      if (pVar < 1e-6) continue;
-      const score = num / (tStd * Math.sqrt(pVar));
+      const dx = edges.dirX[idx];
+      const dy = edges.dirY[idx];
 
-      if (score > bestScore) {
-        bestScore = score;
-        bestX = sx;
-        bestY = sy;
+      // Vote along gradient direction (both sides) for each radius
+      for (let r = rMin; r <= rMax; r++) {
+        const cx1 = Math.round(x + r * dx);
+        const cy1 = Math.round(y + r * dy);
+        if (cx1 >= 0 && cx1 < w && cy1 >= 0 && cy1 < h) acc[cy1 * w + cx1]++;
+
+        const cx2 = Math.round(x - r * dx);
+        const cy2 = Math.round(y - r * dy);
+        if (cx2 >= 0 && cx2 < w && cy2 >= 0 && cy2 < h) acc[cy2 * w + cx2]++;
       }
     }
   }
 
-  return { bestX, bestY, bestScore };
+  // Find peak in accumulator
+  let bestScore = 0, bestCx = 0, bestCy = 0;
+  for (let i = 0; i < acc.length; i++) {
+    if (acc[i] > bestScore) {
+      bestScore = acc[i];
+      bestCx = i % w;
+      bestCy = Math.floor(i / w);
+    }
+  }
+
+  if (bestScore === 0) return null;
+
+  // Determine best radius by counting edge pixels at distance r from detected center
+  let bestR = rMin, bestRScore = 0;
+  for (let r = rMin; r <= rMax; r++) {
+    let rScore = 0;
+    const steps = Math.max(36, Math.round(2 * Math.PI * r / 3));
+    for (let i = 0; i < steps; i++) {
+      const angle = (2 * Math.PI * i) / steps;
+      const ex = Math.round(bestCx + r * Math.cos(angle));
+      const ey = Math.round(bestCy + r * Math.sin(angle));
+      if (ex >= 0 && ex < w && ey >= 0 && ey < h && edges.mag[ey * w + ex] >= threshold) {
+        rScore++;
+      }
+    }
+    if (rScore > bestRScore) {
+      bestRScore = rScore;
+      bestR = r;
+    }
+  }
+
+  return { cx: bestCx, cy: bestCy, radius: bestR, score: bestScore };
+}
+
+function detectBallAtPosition(videoIdx, searchCenterPx) {
+  const videoEl = videoItems[videoIdx].el;
+  const vw = videoEl.videoWidth;
+  const vh = videoEl.videoHeight;
+
+  const scratch = ensureScratchCanvas(videoEl);
+  const sctx = scratch.getContext('2d');
+  sctx.drawImage(videoEl, 0, 0, vw, vh);
+
+  const searchHalf = trackBallRadius + trackSearchRadius;
+  const patch = extractGrayscalePatch(sctx, searchCenterPx.x, searchCenterPx.y, searchHalf, vw, vh);
+  if (!patch) return null;
+
+  const rMin = Math.max(3, Math.round(trackBallRadius * 0.5));
+  const rMax = Math.round(trackBallRadius * 1.5);
+
+  const result = houghCircleDetect(patch.data, patch.w, patch.h, rMin, rMax);
+  if (!result || result.score < 5) return null;
+
+  // Convert back to video pixel coords
+  return {
+    cx: patch.ox + result.cx,
+    cy: patch.oy + result.cy,
+    radius: result.radius,
+    score: result.score,
+  };
 }
 
 function seekAndCapture(videoEl, targetTime) {
@@ -2468,11 +2520,12 @@ function seekAndCapture(videoEl, targetTime) {
   });
 }
 
+// ── Click handler ──
+
 function handleTrackClick(videoIdx, norm) {
   if (selectingGround) {
     trackGroundY = norm.y;
     selectingGround = false;
-    // Recompute heights for existing trajectory
     recomputeTrajectoryHeights();
     redrawAllCanvases();
     showToast(`Ground level set at y=${(norm.y * 100).toFixed(1)}%`);
@@ -2483,59 +2536,115 @@ function handleTrackClick(videoIdx, norm) {
   const vw = videoEl.videoWidth;
   const vh = videoEl.videoHeight;
 
-  // Capture template from current video frame
   const scratch = ensureScratchCanvas(videoEl);
   const sctx = scratch.getContext('2d');
   sctx.drawImage(videoEl, 0, 0, vw, vh);
 
-  const cx = norm.x * vw;
-  const cy = norm.y * vh;
-  const patch = extractGrayscalePatch(sctx, cx, cy, trackTemplateSize, vw, vh);
-  if (!patch) { showToast('Could not capture template'); return; }
+  const clickPx = { x: norm.x * vw, y: norm.y * vh };
 
-  trackTemplate = { data: patch.data, w: patch.w, h: patch.h };
+  // Initial detection with wide radius range
+  const initHalf = 120; // search 240×240 region around click
+  const patch = extractGrayscalePatch(sctx, clickPx.x, clickPx.y, initHalf, vw, vh);
+  if (!patch) { showToast('Could not read video frame'); return; }
+
+  // Try a wide radius range for initial detection
+  const rMin = 5, rMax = 80;
+  const result = houghCircleDetect(patch.data, patch.w, patch.h, rMin, rMax);
+  if (!result || result.score < 5) {
+    showToast('Could not detect a circle — try clicking closer to the ball');
+    return;
+  }
+
+  // Store detected radius and center
+  trackBallRadius = result.radius;
+  trackLastCenter = { x: patch.ox + result.cx, y: patch.oy + result.cy };
   trackVideoIdx = videoIdx;
 
-  // Add or update the current frame in trajectory
+  const normCx = trackLastCenter.x / vw;
+  const normCy = trackLastCenter.y / vh;
+  const normTopY = (trackLastCenter.y - trackBallRadius) / vh;
+
+  // Add first trajectory point
   const frame = Math.round(masterTime * masterFPS);
-  const existing = trajectory.findIndex(p => p.frame === frame);
   const pt = {
     frame,
     masterTime,
-    normX: norm.x,
-    normY: norm.y,
-    heightM: computeTrackHeight(videoIdx, norm),
+    normCx,
+    normCy,
+    normTopY,
+    radiusPx: trackBallRadius,
+    heightM: computeTrackHeight(videoIdx, normCx, normTopY),
   };
-  if (existing >= 0) {
-    trajectory[existing] = pt;
-  } else {
-    trajectory.push(pt);
-    trajectory.sort((a, b) => a.frame - b.frame);
-  }
+  const existing = trajectory.findIndex(p => p.frame === frame);
+  if (existing >= 0) trajectory[existing] = pt;
+  else { trajectory.push(pt); trajectory.sort((a, b) => a.frame - b.frame); }
 
   updateTrackStatus();
   redrawAllCanvases();
-  showToast('Template captured — use Forward/Backward to track');
+  showToast(`Ball detected (r=${trackBallRadius}px) — scrub with arrow keys to track`);
 }
 
-function computeTrackHeight(videoIdx, normPos) {
+// ── Auto-detect on frame step ──
+
+function autoDetectBall() {
+  if (trackVideoIdx === null || trackBallRadius <= 0 || !trackLastCenter) return;
+
+  // Skip if this frame already tracked
+  const frame = Math.round(masterTime * masterFPS);
+  if (trajectory.find(p => p.frame === frame)) return;
+
+  const det = detectBallAtPosition(trackVideoIdx, trackLastCenter);
+  if (!det) return;
+
+  const videoEl = videoItems[trackVideoIdx].el;
+  const vw = videoEl.videoWidth;
+  const vh = videoEl.videoHeight;
+
+  trackLastCenter = { x: det.cx, y: det.cy };
+  trackBallRadius = det.radius;
+
+  const normCx = det.cx / vw;
+  const normCy = det.cy / vh;
+  const normTopY = (det.cy - det.radius) / vh;
+
+  trajectory.push({
+    frame,
+    masterTime,
+    normCx,
+    normCy,
+    normTopY,
+    radiusPx: det.radius,
+    heightM: computeTrackHeight(trackVideoIdx, normCx, normTopY),
+  });
+  trajectory.sort((a, b) => a.frame - b.frame);
+
+  updateTrackStatus();
+  redrawAllCanvases();
+}
+
+// ── Height computation (uses top of ball) ──
+
+function computeTrackHeight(videoIdx, normCx, normTopY) {
   if (trackGroundY === null) return null;
   const cal = calibrations.get(videoIdx);
   if (!cal) return null;
-  const groundPt = { x: normPos.x, y: trackGroundY };
-  return computeHeight(videoIdx, groundPt, normPos);
+  const groundPt = { x: normCx, y: trackGroundY };
+  const topPt = { x: normCx, y: normTopY };
+  return computeHeight(videoIdx, groundPt, topPt);
 }
 
 function recomputeTrajectoryHeights() {
   if (trackVideoIdx === null) return;
   for (const pt of trajectory) {
-    pt.heightM = computeTrackHeight(trackVideoIdx, { x: pt.normX, y: pt.normY });
+    pt.heightM = computeTrackHeight(trackVideoIdx, pt.normCx, pt.normTopY);
   }
 }
 
+// ── Batch tracking ──
+
 async function trackInDirection(direction) {
   if (trackBusy) return;
-  if (!trackTemplate) { showToast('Click the ball first to set a template'); return; }
+  if (trackBallRadius <= 0) { showToast('Click the ball first to initialize'); return; }
   if (trackVideoIdx === null) return;
 
   trackBusy = true;
@@ -2553,21 +2662,17 @@ async function trackInDirection(direction) {
   const vh = videoEl.videoHeight;
   const syncOff = videoItems[trackVideoIdx].syncOffset;
 
-  const scratch = ensureScratchCanvas(videoEl);
-  const sctx = scratch.getContext('2d');
-
-  // Find last known position in the tracking direction
+  // Find starting position
   const currentFrame = Math.round(masterTime * masterFPS);
   let lastPt = trajectory.find(p => p.frame === currentFrame);
   if (!lastPt && trajectory.length > 0) {
-    // Find closest point
     lastPt = trajectory.reduce((best, p) =>
       Math.abs(p.frame - currentFrame) < Math.abs(best.frame - currentFrame) ? p : best
     );
   }
   if (!lastPt) { trackBusy = false; showToast('No starting point'); return; }
 
-  let lastPx = { x: lastPt.normX * vw, y: lastPt.normY * vh };
+  let lastPx = { x: lastPt.normCx * vw, y: lastPt.normCy * vh };
   let t = lastPt.masterTime + step;
   let frameCount = 0;
   const totalFrames = Math.abs((limit - lastPt.masterTime) * masterFPS);
@@ -2577,55 +2682,38 @@ async function trackInDirection(direction) {
     if (videoTime < 0 || videoTime > videoEl.duration) break;
 
     await seekAndCapture(videoEl, videoTime);
-    sctx.drawImage(videoEl, 0, 0, vw, vh);
 
-    // Extract search region around last known position
-    const searchHalf = trackTemplateSize + trackSearchRadius;
-    const searchPatch = extractGrayscalePatch(sctx, lastPx.x, lastPx.y, searchHalf, vw, vh);
-    if (!searchPatch) break;
-
-    // Run NCC
-    const match = computeNCC(
-      trackTemplate.data, trackTemplate.w, trackTemplate.h,
-      searchPatch.data, searchPatch.w, searchPatch.h
-    );
-
-    if (match.bestScore < 0.5) {
-      showToast(`Tracking lost at frame ${Math.round(t * masterFPS)} (score: ${match.bestScore.toFixed(2)})`);
+    const det = detectBallAtPosition(trackVideoIdx, lastPx);
+    if (!det) {
+      showToast(`Tracking lost at frame ${Math.round(t * masterFPS)}`);
       break;
     }
 
-    // Convert match position back to video pixel coords
-    // match.bestX/Y is top-left of best match within search patch
-    // Center of match = bestX + templateW/2, bestY + templateH/2, relative to search patch origin
-    const matchCx = searchPatch.ox + match.bestX + trackTemplate.w / 2;
-    const matchCy = searchPatch.oy + match.bestY + trackTemplate.h / 2;
-    const normX = matchCx / vw;
-    const normY = matchCy / vh;
+    const normCx = det.cx / vw;
+    const normCy = det.cy / vh;
+    const normTopY = (det.cy - det.radius) / vh;
 
     const frame = Math.round(t * masterFPS);
     const existingIdx = trajectory.findIndex(p => p.frame === frame);
     const pt = {
       frame,
       masterTime: t,
-      normX,
-      normY,
-      heightM: computeTrackHeight(trackVideoIdx, { x: normX, y: normY }),
+      normCx,
+      normCy,
+      normTopY,
+      radiusPx: det.radius,
+      heightM: computeTrackHeight(trackVideoIdx, normCx, normTopY),
     };
-    if (existingIdx >= 0) {
-      trajectory[existingIdx] = pt;
-    } else {
-      trajectory.push(pt);
-    }
+    if (existingIdx >= 0) trajectory[existingIdx] = pt;
+    else trajectory.push(pt);
 
-    lastPx = { x: matchCx, y: matchCy };
+    lastPx = { x: det.cx, y: det.cy };
     t += step;
     frameCount++;
 
-    // Update UI periodically
     if (frameCount % 30 === 0) {
       trajectory.sort((a, b) => a.frame - b.frame);
-      if (statusEl) statusEl.textContent = `Tracking: ${frameCount} frames (score: ${match.bestScore.toFixed(2)})`;
+      if (statusEl) statusEl.textContent = `Tracking: ${frameCount} frames`;
       if (progressBar) progressBar.style.width = `${Math.min(100, (frameCount / totalFrames) * 100)}%`;
       seekToMaster(t);
       redrawAllCanvases();
@@ -2638,11 +2726,14 @@ async function trackInDirection(direction) {
   if (progressWrap) progressWrap.style.display = 'none';
   if (stopBtn) stopBtn.style.display = 'none';
   if (progressBar) progressBar.style.width = '0%';
+  trackLastCenter = lastPx;
   updateTrackStatus();
-  seekToMaster(t - step); // stay at last tracked frame
+  seekToMaster(t - step);
   redrawAllCanvases();
   showToast(`Tracked ${frameCount} frames ${direction}`);
 }
+
+// ── Visualization ──
 
 function drawTrajectory(ctx, canvas, traj) {
   const W = canvas.width, H = canvas.height;
@@ -2650,7 +2741,7 @@ function drawTrajectory(ctx, canvas, traj) {
 
   ctx.save();
 
-  // Draw ground reference line
+  // Ground reference line
   if (trackGroundY !== null) {
     ctx.strokeStyle = 'rgba(74, 255, 138, 0.3)';
     ctx.lineWidth = 1;
@@ -2662,39 +2753,55 @@ function drawTrajectory(ctx, canvas, traj) {
     ctx.setLineDash([]);
   }
 
-  // Draw connecting line
+  // Trajectory line connecting TOP of ball
   ctx.strokeStyle = 'rgba(255, 204, 68, 0.5)';
   ctx.lineWidth = 1.5;
   ctx.beginPath();
   for (let i = 0; i < traj.length; i++) {
-    const px = traj[i].normX * W;
-    const py = traj[i].normY * H;
+    const px = traj[i].normCx * W;
+    const py = traj[i].normTopY * H;
     if (i === 0) ctx.moveTo(px, py);
     else ctx.lineTo(px, py);
   }
   ctx.stroke();
 
-  // Draw dots
+  // Small dot at top of each tracked frame
   for (const pt of traj) {
     ctx.fillStyle = '#ffcc44';
     ctx.beginPath();
-    ctx.arc(pt.normX * W, pt.normY * H, 2, 0, Math.PI * 2);
+    ctx.arc(pt.normCx * W, pt.normTopY * H, 2, 0, Math.PI * 2);
     ctx.fill();
   }
 
-  // Highlight current frame's point
+  // Highlight current frame: show detected circle outline + top marker
   const currentFrame = Math.round(masterTime * masterFPS);
   const currentPt = traj.find(p => p.frame === currentFrame);
   if (currentPt) {
-    ctx.strokeStyle = '#ff4a6a';
-    ctx.lineWidth = 2;
+    const cx = currentPt.normCx * W;
+    const cy = currentPt.normCy * H;
+    // Scale radius from video pixels to canvas pixels
+    const videoEl = videoItems[trackVideoIdx]?.el;
+    const scaleX = videoEl ? W / videoEl.videoWidth : 1;
+    const r = currentPt.radiusPx * scaleX;
+
+    // Circle outline
+    ctx.strokeStyle = 'rgba(255, 74, 106, 0.7)';
+    ctx.lineWidth = 1.5;
     ctx.beginPath();
-    ctx.arc(currentPt.normX * W, currentPt.normY * H, 6, 0, Math.PI * 2);
+    ctx.arc(cx, cy, r, 0, Math.PI * 2);
     ctx.stroke();
+
+    // Top marker
+    ctx.fillStyle = '#ff4a6a';
+    ctx.beginPath();
+    ctx.arc(cx, currentPt.normTopY * H, 4, 0, Math.PI * 2);
+    ctx.fill();
   }
 
   ctx.restore();
 }
+
+// ── Export ──
 
 function exportTrajectory() {
   if (trajectory.length === 0) { showToast('No trajectory to export'); return; }
@@ -2711,18 +2818,18 @@ function exportTrajectory() {
     realTimeFactor,
     calibration: cal ? { realHeight: cal.realHeight, unit: cal.unit } : null,
     groundY: trackGroundY,
-    templateSize: trackTemplateSize,
+    ballRadius: trackBallRadius,
   };
 
-  const headers = ['frame', 'time_s', 'real_time_s', 'norm_x', 'norm_y', 'pixel_x', 'pixel_y', 'height', 'height_unit'];
+  const headers = ['frame', 'time_s', 'real_time_s', 'center_x', 'center_y', 'top_y', 'radius_px', 'height', 'height_unit'];
   const dataRows = trajectory.map(pt => [
     pt.frame,
     pt.masterTime.toFixed(6),
     toRealTime(pt.masterTime).toFixed(6),
-    pt.normX.toFixed(6),
-    pt.normY.toFixed(6),
-    Math.round(pt.normX * vw),
-    Math.round(pt.normY * vh),
+    Math.round(pt.normCx * vw),
+    Math.round(pt.normCy * vh),
+    Math.round(pt.normTopY * vh),
+    pt.radiusPx,
     pt.heightM != null ? pt.heightM.toFixed(4) : '',
     cal ? cal.unit : '',
   ]);
@@ -2983,19 +3090,21 @@ const HELP_CONTENT = {
         <ol class="help-steps">
           <li data-n="1">Calibrate a reference height first (press <strong>C</strong>).</li>
           <li data-n="2">Press <strong>B</strong> or click <strong>⊙ Track</strong> to enter tracking mode.</li>
-          <li data-n="3">Click the ball to capture a template patch.</li>
-          <li data-n="4">Press <strong>G</strong> or click <strong>Set Ground</strong>, then click the ground level.</li>
-          <li data-n="5">Press <strong>F</strong> to track forward or <strong>R</strong> to track backward. The tracker uses NCC template matching to follow the ball frame-by-frame.</li>
-          <li data-n="6">Click <strong>Export Traj.</strong> to save the trajectory as CSV.</li>
+          <li data-n="3">Click the ball — Hough circle detection finds its outline and radius.</li>
+          <li data-n="4">Scrub with <strong>← →</strong> arrow keys — the ball is auto-detected each frame.</li>
+          <li data-n="5">Press <strong>G</strong> to set ground level for height measurement.</li>
+          <li data-n="6">Use <strong>F</strong> / <strong>R</strong> for batch tracking forward/backward.</li>
+          <li data-n="7">Click <strong>Export Traj.</strong> to save as CSV (tracks the <em>top</em> of the ball).</li>
         </ol>
         <table class="help-keys" style="margin-top:8px;">
           <tr><td><span class="kbd">B</span></td><td>Toggle tracking mode</td></tr>
-          <tr><td><span class="kbd">F</span></td><td>Track forward (in track mode)</td></tr>
-          <tr><td><span class="kbd">R</span></td><td>Track backward</td></tr>
+          <tr><td><span class="kbd">← →</span></td><td>Step frame — ball auto-detected</td></tr>
+          <tr><td><span class="kbd">F</span></td><td>Batch track forward</td></tr>
+          <tr><td><span class="kbd">R</span></td><td>Batch track backward</td></tr>
           <tr><td><span class="kbd">G</span></td><td>Set ground level</td></tr>
           <tr><td><span class="kbd">Esc</span></td><td>Stop tracking / exit track mode</td></tr>
         </table>
-        <p style="margin-top:6px;">Click on the ball at any time to reposition the template and correct tracking errors. Adjust <strong>Size</strong> (template half-size in pixels) and <strong>Search</strong> (search radius) in the toolbar for your video.</p>
+        <p style="margin-top:6px;">Click the ball at any time to re-initialize detection. The trajectory tracks the <strong>top of the ball</strong> (center − radius) for accurate height measurement.</p>
       </div>
       <div class="help-section">
         <h3>Zoom &amp; Pan</h3>
