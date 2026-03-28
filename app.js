@@ -2391,94 +2391,106 @@ function extractGrayscalePatch(scratchCtx, cx, cy, halfSize, vw, vh) {
   return { data: gray, w, h, ox: x0, oy: y0 };
 }
 
-// ── Hough circle detection ──
+// ── Ball detection: threshold + flood fill ──
 
-function sobelEdges(gray, w, h) {
-  const mag = new Float32Array(w * h);
-  const dirX = new Float32Array(w * h);
-  const dirY = new Float32Array(w * h);
+function otsuThreshold(gray) {
+  const hist = new Int32Array(256);
+  for (let i = 0; i < gray.length; i++) hist[Math.min(255, Math.max(0, Math.round(gray[i])))]++;
 
-  for (let y = 1; y < h - 1; y++) {
-    for (let x = 1; x < w - 1; x++) {
-      const idx = y * w + x;
-      const gx = -gray[(y - 1) * w + (x - 1)] - 2 * gray[y * w + (x - 1)] - gray[(y + 1) * w + (x - 1)]
-               +  gray[(y - 1) * w + (x + 1)] + 2 * gray[y * w + (x + 1)] + gray[(y + 1) * w + (x + 1)];
-      const gy = -gray[(y - 1) * w + (x - 1)] - 2 * gray[(y - 1) * w + x] - gray[(y - 1) * w + (x + 1)]
-               +  gray[(y + 1) * w + (x - 1)] + 2 * gray[(y + 1) * w + x] + gray[(y + 1) * w + (x + 1)];
+  const total = gray.length;
+  let sumAll = 0;
+  for (let i = 0; i < 256; i++) sumAll += i * hist[i];
 
-      const m = Math.sqrt(gx * gx + gy * gy);
-      mag[idx] = m;
-      const len = m || 1;
-      dirX[idx] = gx / len;
-      dirY[idx] = gy / len;
-    }
+  let bestThresh = 128, bestVar = 0;
+  let sumBg = 0, countBg = 0;
+
+  for (let t = 0; t < 256; t++) {
+    countBg += hist[t];
+    if (countBg === 0) continue;
+    const countFg = total - countBg;
+    if (countFg === 0) break;
+
+    sumBg += t * hist[t];
+    const meanBg = sumBg / countBg;
+    const meanFg = (sumAll - sumBg) / countFg;
+    const v = countBg * countFg * (meanBg - meanFg) ** 2;
+    if (v > bestVar) { bestVar = v; bestThresh = t; }
   }
-  return { mag, dirX, dirY };
+  return bestThresh;
 }
 
-function houghCircleDetect(gray, w, h, rMin, rMax) {
-  const edges = sobelEdges(gray, w, h);
+function detectBallBlob(gray, w, h, seedX, seedY) {
+  const sx = Math.round(Math.max(0, Math.min(w - 1, seedX)));
+  const sy = Math.round(Math.max(0, Math.min(h - 1, seedY)));
+  const seedVal = gray[sy * w + sx];
 
-  // Adaptive edge threshold: top 15% of edge magnitudes
-  const sorted = Array.from(edges.mag).sort((a, b) => b - a);
-  const threshold = sorted[Math.floor(sorted.length * 0.15)] || 30;
+  // Sample border to determine ball vs background polarity
+  let borderSum = 0, borderN = 0;
+  for (let x = 0; x < w; x++) { borderSum += gray[x] + gray[(h - 1) * w + x]; borderN += 2; }
+  for (let y = 1; y < h - 1; y++) { borderSum += gray[y * w] + gray[y * w + w - 1]; borderN += 2; }
+  const borderMean = borderSum / borderN;
+  const ballIsDark = seedVal < borderMean;
 
-  // Accumulator for center votes
-  const acc = new Int32Array(w * h);
+  const thresh = otsuThreshold(gray);
 
-  for (let y = 1; y < h - 1; y++) {
-    for (let x = 1; x < w - 1; x++) {
-      const idx = y * w + x;
-      if (edges.mag[idx] < threshold) continue;
+  // Binary mask: 1 = ball pixel
+  const binary = new Uint8Array(w * h);
+  for (let i = 0; i < gray.length; i++) {
+    binary[i] = ballIsDark ? (gray[i] <= thresh ? 1 : 0) : (gray[i] > thresh ? 1 : 0);
+  }
 
-      const dx = edges.dirX[idx];
-      const dy = edges.dirY[idx];
-
-      // Vote along gradient direction (both sides) for each radius
-      for (let r = rMin; r <= rMax; r++) {
-        const cx1 = Math.round(x + r * dx);
-        const cy1 = Math.round(y + r * dy);
-        if (cx1 >= 0 && cx1 < w && cy1 >= 0 && cy1 < h) acc[cy1 * w + cx1]++;
-
-        const cx2 = Math.round(x - r * dx);
-        const cy2 = Math.round(y - r * dy);
-        if (cx2 >= 0 && cx2 < w && cy2 >= 0 && cy2 < h) acc[cy2 * w + cx2]++;
+  // Find seed in the ball — if click isn't on ball, spiral outward
+  let startIdx = sy * w + sx;
+  if (!binary[startIdx]) {
+    let found = false;
+    for (let r = 1; r < Math.min(w, h) / 2 && !found; r++) {
+      const steps = Math.max(8, r * 4);
+      for (let i = 0; i < steps; i++) {
+        const angle = (2 * Math.PI * i) / steps;
+        const nx = Math.round(sx + r * Math.cos(angle));
+        const ny = Math.round(sy + r * Math.sin(angle));
+        if (nx >= 0 && nx < w && ny >= 0 && ny < h && binary[ny * w + nx]) {
+          startIdx = ny * w + nx;
+          found = true;
+          break;
+        }
       }
     }
+    if (!found) return null;
   }
 
-  // Find peak in accumulator
-  let bestScore = 0, bestCx = 0, bestCy = 0;
-  for (let i = 0; i < acc.length; i++) {
-    if (acc[i] > bestScore) {
-      bestScore = acc[i];
-      bestCx = i % w;
-      bestCy = Math.floor(i / w);
-    }
+  // Flood fill
+  const visited = new Uint8Array(w * h);
+  const stack = [startIdx];
+  let sumX = 0, sumY = 0, count = 0;
+  let minY = h, maxY = 0;
+
+  while (stack.length > 0) {
+    const idx = stack.pop();
+    if (visited[idx]) continue;
+    visited[idx] = 1;
+
+    const px = idx % w;
+    const py = (idx - px) / w;
+    sumX += px;
+    sumY += py;
+    if (py < minY) minY = py;
+    if (py > maxY) maxY = py;
+    count++;
+
+    if (px > 0     && binary[idx - 1] && !visited[idx - 1]) stack.push(idx - 1);
+    if (px < w - 1 && binary[idx + 1] && !visited[idx + 1]) stack.push(idx + 1);
+    if (py > 0     && binary[idx - w] && !visited[idx - w]) stack.push(idx - w);
+    if (py < h - 1 && binary[idx + w] && !visited[idx + w]) stack.push(idx + w);
   }
 
-  if (bestScore === 0) return null;
+  if (count < 10) return null;
 
-  // Determine best radius by counting edge pixels at distance r from detected center
-  let bestR = rMin, bestRScore = 0;
-  for (let r = rMin; r <= rMax; r++) {
-    let rScore = 0;
-    const steps = Math.max(36, Math.round(2 * Math.PI * r / 3));
-    for (let i = 0; i < steps; i++) {
-      const angle = (2 * Math.PI * i) / steps;
-      const ex = Math.round(bestCx + r * Math.cos(angle));
-      const ey = Math.round(bestCy + r * Math.sin(angle));
-      if (ex >= 0 && ex < w && ey >= 0 && ey < h && edges.mag[ey * w + ex] >= threshold) {
-        rScore++;
-      }
-    }
-    if (rScore > bestRScore) {
-      bestRScore = rScore;
-      bestR = r;
-    }
-  }
+  const blobCx = sumX / count;
+  const blobCy = sumY / count;
+  const radius = Math.sqrt(count / Math.PI);
 
-  return { cx: bestCx, cy: bestCy, radius: bestR, score: bestScore };
+  return { cx: blobCx, cy: blobCy, radius, area: count, topY: minY };
 }
 
 function detectBallAtPosition(videoIdx, searchCenterPx) {
@@ -2490,22 +2502,26 @@ function detectBallAtPosition(videoIdx, searchCenterPx) {
   const sctx = scratch.getContext('2d');
   sctx.drawImage(videoEl, 0, 0, vw, vh);
 
-  const searchHalf = trackBallRadius + trackSearchRadius;
+  const searchHalf = Math.max(trackBallRadius * 3, trackSearchRadius);
   const patch = extractGrayscalePatch(sctx, searchCenterPx.x, searchCenterPx.y, searchHalf, vw, vh);
   if (!patch) return null;
 
-  const rMin = Math.max(3, Math.round(trackBallRadius * 0.5));
-  const rMax = Math.round(trackBallRadius * 1.5);
+  // Seed point is the center of the patch (= previous ball position)
+  const localSeedX = searchCenterPx.x - patch.ox;
+  const localSeedY = searchCenterPx.y - patch.oy;
 
-  const result = houghCircleDetect(patch.data, patch.w, patch.h, rMin, rMax);
-  if (!result || result.score < 5) return null;
+  const blob = detectBallBlob(patch.data, patch.w, patch.h, localSeedX, localSeedY);
+  if (!blob) return null;
 
-  // Convert back to video pixel coords
+  // Sanity check: reject if area changed drastically from expected
+  const expectedArea = Math.PI * trackBallRadius * trackBallRadius;
+  if (blob.area < expectedArea * 0.3 || blob.area > expectedArea * 3) return null;
+
   return {
-    cx: patch.ox + result.cx,
-    cy: patch.oy + result.cy,
-    radius: result.radius,
-    score: result.score,
+    cx: patch.ox + blob.cx,
+    cy: patch.oy + blob.cy,
+    radius: blob.radius,
+    topY: patch.oy + blob.topY,
   };
 }
 
@@ -2542,27 +2558,26 @@ function handleTrackClick(videoIdx, norm) {
 
   const clickPx = { x: norm.x * vw, y: norm.y * vh };
 
-  // Initial detection with wide radius range
-  const initHalf = 120; // search 240×240 region around click
+  // Detect ball blob around click point
+  const initHalf = 120;
   const patch = extractGrayscalePatch(sctx, clickPx.x, clickPx.y, initHalf, vw, vh);
   if (!patch) { showToast('Could not read video frame'); return; }
 
-  // Try a wide radius range for initial detection
-  const rMin = 5, rMax = 80;
-  const result = houghCircleDetect(patch.data, patch.w, patch.h, rMin, rMax);
-  if (!result || result.score < 5) {
-    showToast('Could not detect a circle — try clicking closer to the ball');
+  const localX = clickPx.x - patch.ox;
+  const localY = clickPx.y - patch.oy;
+  const blob = detectBallBlob(patch.data, patch.w, patch.h, localX, localY);
+  if (!blob || blob.area < 10) {
+    showToast('Could not detect the ball — try clicking directly on it');
     return;
   }
 
-  // Store detected radius and center
-  trackBallRadius = result.radius;
-  trackLastCenter = { x: patch.ox + result.cx, y: patch.oy + result.cy };
+  trackBallRadius = blob.radius;
+  trackLastCenter = { x: patch.ox + blob.cx, y: patch.oy + blob.cy };
   trackVideoIdx = videoIdx;
 
   const normCx = trackLastCenter.x / vw;
   const normCy = trackLastCenter.y / vh;
-  const normTopY = (trackLastCenter.y - trackBallRadius) / vh;
+  const normTopY = (patch.oy + blob.topY) / vh;
 
   // Add first trajectory point
   const frame = Math.round(masterTime * masterFPS);
@@ -2605,7 +2620,7 @@ function autoDetectBall() {
 
   const normCx = det.cx / vw;
   const normCy = det.cy / vh;
-  const normTopY = (det.cy - det.radius) / vh;
+  const normTopY = det.topY / vh;
 
   trajectory.push({
     frame,
@@ -2691,7 +2706,7 @@ async function trackInDirection(direction) {
 
     const normCx = det.cx / vw;
     const normCy = det.cy / vh;
-    const normTopY = (det.cy - det.radius) / vh;
+    const normTopY = det.topY / vh;
 
     const frame = Math.round(t * masterFPS);
     const existingIdx = trajectory.findIndex(p => p.frame === frame);
@@ -3090,7 +3105,7 @@ const HELP_CONTENT = {
         <ol class="help-steps">
           <li data-n="1">Calibrate a reference height first (press <strong>C</strong>).</li>
           <li data-n="2">Press <strong>B</strong> or click <strong>⊙ Track</strong> to enter tracking mode.</li>
-          <li data-n="3">Click the ball — Hough circle detection finds its outline and radius.</li>
+          <li data-n="3">Click the ball — circle detection finds its outline and radius.</li>
           <li data-n="4">Scrub with <strong>← →</strong> arrow keys — the ball is auto-detected each frame.</li>
           <li data-n="5">Press <strong>G</strong> to set ground level for height measurement.</li>
           <li data-n="6">Use <strong>F</strong> / <strong>R</strong> for batch tracking forward/backward.</li>
