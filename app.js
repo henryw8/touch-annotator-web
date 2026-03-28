@@ -72,9 +72,10 @@ let measureFirstClick    = null;      // {x, y, videoIdx} normalized
 // Ball trajectory tracking state
 let trackMode            = false;
 let trackVideoIdx        = null;       // which video is being tracked
-let trackGroundY         = null;       // normalized Y coordinate of ground plane
-let trajectory           = [];         // [{ frame, masterTime, normX, normY, heightM }]
+let trackGroundPt        = null;       // {x, y} normalized — point on the ground line
+let trajectory           = [];         // [{ frame, masterTime, normX, normY, heightM, phase }]
 let selectingGround      = false;      // true when waiting for ground click
+let trackPhase           = 'up';       // current phase: 'up' | 'contact' | 'down'
 
 // Zoom/pan state per video
 const zoomStates = new Map(); // videoIdx → { scale, panX, panY, container }
@@ -714,25 +715,38 @@ function buildAnnotateScreen() {
   trackToolbar.id = 'track-toolbar';
   trackToolbar.className = 'draw-toolbar';  // reuse draw-toolbar styling
   trackToolbar.innerHTML = `
-    <span id="track-status" style="font-size:12px;color:var(--text-dim);">Click ball top at each frame — height auto-computed</span>
+    <span id="track-status" style="font-size:12px;color:var(--text-dim);">Click ball position at each frame — height auto-computed</span>
     <div class="draw-sep"></div>
     <button class="btn btn-sm" id="track-set-ground" title="Click ground level on video (G)">Set Ground</button>
+    <div class="draw-sep"></div>
+    <span style="font-size:11px;color:var(--text-dim);">Phase:</span>
+    <button class="btn btn-sm tool-active" data-phase="up" title="Ball going up">↑ Up</button>
+    <button class="btn btn-sm" data-phase="contact" title="Ball contacting ground">⊙ Contact</button>
+    <button class="btn btn-sm" data-phase="down" title="Ball coming down">↓ Down</button>
+    <div class="draw-sep"></div>
     <button class="btn btn-sm" id="track-export">Export Traj.</button>
     <button class="btn btn-sm" id="track-clear">Clear</button>
     <button class="btn btn-sm" id="track-close">✕</button>
   `;
   annotateMain.insertBefore(trackToolbar, videoGrid);
 
+  trackToolbar.querySelectorAll('[data-phase]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      trackPhase = btn.dataset.phase;
+      trackToolbar.querySelectorAll('[data-phase]').forEach(b => b.classList.toggle('tool-active', b.dataset.phase === trackPhase));
+    });
+  });
   document.getElementById('track-set-ground').addEventListener('click', () => {
     selectingGround = true;
-    showToast('Click the ground level on the video');
+    showToast('Click a point on the ground');
   });
   document.getElementById('track-export').addEventListener('click', exportTrajectory);
   document.getElementById('track-clear').addEventListener('click', () => {
     if (trajectory.length === 0) { showToast('No trajectory to clear'); return; }
     trajectory = [];
-    trackGroundY = null;
+    trackGroundPt = null;
     trackVideoIdx = null;
+    trackPhase = 'up';
     updateTrackStatus();
     redrawAllCanvases();
     showToast('Trajectory cleared');
@@ -2031,7 +2045,7 @@ function redrawCanvas(videoIdx) {
   const hasMeasureState = measureFirstClick && measureFirstClick.videoIdx === videoIdx;
 
   // Hide canvas when not needed — avoids browser compositing issues with video
-  const hasTrajectory = trajectory.length > 0 && trackVideoIdx === videoIdx;
+  const hasTrajectory = (trajectory.length > 0 || trackGroundPt) && trackVideoIdx === videoIdx;
   const hasContent = elements.length > 0
     || (lineStartPoint && lineStartVideoIdx === videoIdx)
     || (calibStartPoint && calibStartVideoIdx === videoIdx)
@@ -2331,22 +2345,22 @@ function updateTrackStatus() {
 
 function handleTrackClick(videoIdx, norm) {
   if (selectingGround) {
-    trackGroundY = norm.y;
+    trackGroundPt = { x: norm.x, y: norm.y };
     selectingGround = false;
     recomputeTrajectoryHeights();
     redrawAllCanvases();
-    showToast(`Ground set — heights will be computed automatically`);
+    showToast('Ground set — heights will be computed automatically');
     updateTrackStatus();
     return;
   }
 
   // Require calibration for height computation
-  if (calibrations.size === 0) {
-    showToast('Calibrate first (C) — needed for height measurement');
+  if (!calibrations.has(videoIdx)) {
+    showToast('Calibrate this video first (C) — needed for height measurement');
     return;
   }
-  if (trackGroundY === null) {
-    showToast('Set ground level first (G) — click "Set Ground" then click the ground');
+  if (!trackGroundPt) {
+    showToast('Set ground first (G) — click "Set Ground" then click the ground');
     return;
   }
 
@@ -2355,7 +2369,7 @@ function handleTrackClick(videoIdx, norm) {
   const frame = Math.round(masterTime * masterFPS);
   const heightM = computeTrackHeight(videoIdx, norm.x, norm.y);
 
-  const pt = { frame, masterTime, normX: norm.x, normY: norm.y, heightM };
+  const pt = { frame, masterTime, normX: norm.x, normY: norm.y, heightM, phase: trackPhase };
   const existing = trajectory.findIndex(p => p.frame === frame);
   if (existing >= 0) trajectory[existing] = pt;
   else { trajectory.push(pt); trajectory.sort((a, b) => a.frame - b.frame); }
@@ -2365,10 +2379,30 @@ function handleTrackClick(videoIdx, norm) {
 }
 
 function computeTrackHeight(videoIdx, normX, normY) {
-  if (trackGroundY === null) return null;
+  if (!trackGroundPt) return null;
   const cal = calibrations.get(videoIdx);
   if (!cal) return null;
-  return computeHeight(videoIdx, { x: normX, y: trackGroundY }, { x: normX, y: normY });
+  const canvas = drawingData.get(videoIdx).canvas;
+  const W = canvas.width, H = canvas.height;
+
+  // Calibration line defines the "up" direction (can be tilted)
+  const calDx = (cal.end.x - cal.start.x) * W;
+  const calDy = (cal.end.y - cal.start.y) * H;
+  const calLen = Math.sqrt(calDx * calDx + calDy * calDy);
+  if (calLen < 1) return null;
+
+  // Unit vector along calibration direction
+  const ux = calDx / calLen;
+  const uy = calDy / calLen;
+
+  // Vector from ground point to clicked point (in canvas pixels)
+  const dx = (normX - trackGroundPt.x) * W;
+  const dy = (normY - trackGroundPt.y) * H;
+
+  // Project onto calibration direction — this is the height in pixels
+  const projPx = Math.abs(dx * ux + dy * uy);
+
+  return (projPx / calLen) * cal.realHeight;
 }
 
 function recomputeTrajectoryHeights() {
@@ -2382,25 +2416,41 @@ function recomputeTrajectoryHeights() {
 
 function drawTrajectory(ctx, canvas, traj) {
   const W = canvas.width, H = canvas.height;
-  if (traj.length === 0) return;
+  if (traj.length === 0 && !trackGroundPt) return;
 
   ctx.save();
 
-  // Ground reference line
-  if (trackGroundY !== null) {
-    ctx.strokeStyle = 'rgba(74, 255, 138, 0.3)';
-    ctx.lineWidth = 1;
-    ctx.setLineDash([4, 4]);
-    ctx.beginPath();
-    ctx.moveTo(0, trackGroundY * H);
-    ctx.lineTo(W, trackGroundY * H);
-    ctx.stroke();
-    ctx.setLineDash([]);
+  // Ground reference line — perpendicular to calibration direction
+  if (trackGroundPt && trackVideoIdx !== null) {
+    const cal = calibrations.get(trackVideoIdx);
+    if (cal) {
+      const calDx = (cal.end.x - cal.start.x) * W;
+      const calDy = (cal.end.y - cal.start.y) * H;
+      const calLen = Math.sqrt(calDx * calDx + calDy * calDy);
+      if (calLen > 0) {
+        // Perpendicular direction to calibration line
+        const perpX = -calDy / calLen;
+        const perpY = calDx / calLen;
+        const gx = trackGroundPt.x * W;
+        const gy = trackGroundPt.y * H;
+        const ext = Math.max(W, H);
+        ctx.strokeStyle = 'rgba(74, 255, 138, 0.3)';
+        ctx.lineWidth = 1;
+        ctx.setLineDash([4, 4]);
+        ctx.beginPath();
+        ctx.moveTo(gx - perpX * ext, gy - perpY * ext);
+        ctx.lineTo(gx + perpX * ext, gy + perpY * ext);
+        ctx.stroke();
+        ctx.setLineDash([]);
+      }
+    }
   }
 
-  // Trajectory line connecting clicked points
+  if (traj.length === 0) { ctx.restore(); return; }
+
+  // Trajectory line
   ctx.strokeStyle = 'rgba(255, 204, 68, 0.5)';
-  ctx.lineWidth = 1.5;
+  ctx.lineWidth = 1;
   ctx.beginPath();
   for (let i = 0; i < traj.length; i++) {
     const px = traj[i].normX * W;
@@ -2410,11 +2460,12 @@ function drawTrajectory(ctx, canvas, traj) {
   }
   ctx.stroke();
 
-  // Dot at each point
+  // Dot at each point — color by phase
+  const phaseColors = { up: '#4aff8a', contact: '#ffcc44', down: '#ff4a6a' };
   for (const pt of traj) {
-    ctx.fillStyle = '#ffcc44';
+    ctx.fillStyle = phaseColors[pt.phase] || '#ffcc44';
     ctx.beginPath();
-    ctx.arc(pt.normX * W, pt.normY * H, 3, 0, Math.PI * 2);
+    ctx.arc(pt.normX * W, pt.normY * H, 1.5, 0, Math.PI * 2);
     ctx.fill();
   }
 
@@ -2422,10 +2473,10 @@ function drawTrajectory(ctx, canvas, traj) {
   const currentFrame = Math.round(masterTime * masterFPS);
   const currentPt = traj.find(p => p.frame === currentFrame);
   if (currentPt) {
-    ctx.strokeStyle = '#ff4a6a';
-    ctx.lineWidth = 2;
+    ctx.strokeStyle = phaseColors[currentPt.phase] || '#ff4a6a';
+    ctx.lineWidth = 1.5;
     ctx.beginPath();
-    ctx.arc(currentPt.normX * W, currentPt.normY * H, 6, 0, Math.PI * 2);
+    ctx.arc(currentPt.normX * W, currentPt.normY * H, 4, 0, Math.PI * 2);
     ctx.stroke();
   }
 
@@ -2445,16 +2496,17 @@ function exportTrajectory() {
     videos: [{ name: item.name, syncOffset: item.syncOffset, fps: item.fps }],
     realTimeFactor,
     calibration: cal ? { realHeight: cal.realHeight, unit: cal.unit } : null,
-    groundY: trackGroundY,
+    groundPt: trackGroundPt,
   };
 
-  const headers = ['frame', 'time_s', 'real_time_s', 'height', 'height_unit'];
+  const headers = ['frame', 'time_s', 'real_time_s', 'height', 'height_unit', 'phase'];
   const dataRows = trajectory.map(pt => [
     pt.frame,
     pt.masterTime.toFixed(6),
     toRealTime(pt.masterTime).toFixed(6),
     pt.heightM != null ? pt.heightM.toFixed(4) : '',
     cal ? cal.unit : '',
+    pt.phase || '',
   ]);
 
   const metaLine = '#meta ' + JSON.stringify(metaObj);
