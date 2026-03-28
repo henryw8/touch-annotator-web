@@ -2591,28 +2591,28 @@ function handleTrackDrag(videoIdx, start, end, mode) {
   const videoEl = videoItems[videoIdx].el;
   const vw = videoEl.videoWidth;
   const vh = videoEl.videoHeight;
+  const { canvas } = drawingData.get(videoIdx);
+  const W = canvas.width, H = canvas.height;
 
   let normCx, normCy, radiusPx;
 
   if (mode === 'move') {
-    // Shift center by mouse delta, keep radius
     normCx = start.origCx + (end.x - start.x);
     normCy = start.origCy + (end.y - start.y);
     radiusPx = start.origR;
   } else if (mode === 'resize') {
-    // Keep center, radius = distance from center to cursor
     normCx = start.origCx;
     normCy = start.origCy;
-    const dx = (end.x - normCx) * vw;
-    const dy = (end.y - normCy) * vh;
-    radiusPx = Math.sqrt(dx * dx + dy * dy);
+    // Compute in canvas pixels (matches preview), convert via X scale
+    const dxC = (end.x - normCx) * W;
+    const dyC = (end.y - normCy) * H;
+    radiusPx = Math.sqrt(dxC * dxC + dyC * dyC) * (vw / W);
   } else {
-    // New circle: center = start, radius = distance to end
     normCx = start.x;
     normCy = start.y;
-    const dx = (end.x - start.x) * vw;
-    const dy = (end.y - start.y) * vh;
-    radiusPx = Math.sqrt(dx * dx + dy * dy);
+    const dxC = (end.x - start.x) * W;
+    const dyC = (end.y - start.y) * H;
+    radiusPx = Math.sqrt(dxC * dxC + dyC * dyC) * (vw / W);
   }
 
   if (radiusPx < 3) { showToast('Drag further to set ball size'); return; }
