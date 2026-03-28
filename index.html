@@ -540,6 +540,18 @@
     }
 
     /* ── Measure mode cursor ── */
+    .draw-overlay.track-active {
+      pointer-events: auto;
+      cursor: crosshair;
+    }
+    .track-progress {
+      height: 3px; background: var(--surface2); border-radius: 2px;
+      overflow: hidden; flex: 1; min-width: 80px;
+    }
+    .track-progress-bar {
+      height: 100%; width: 0%; background: var(--accent);
+      transition: width 0.1s linear;
+    }
     .draw-overlay.measure-active {
       pointer-events: auto;
       cursor: crosshair;
@@ -651,6 +663,7 @@
           </label>
           <button class="btn btn-sm" id="btn-draw" title="Toggle drawing mode (D)" style="margin-left:4px;">✏ Draw</button>
           <button class="btn btn-sm" id="btn-calibrate" title="Toggle calibration mode (C)" style="margin-left:4px;">⊿ Calibrate</button>
+          <button class="btn btn-sm" id="btn-track" title="Toggle ball tracking mode (B)" style="margin-left:4px;">⊙ Track</button>
           <button class="help-btn" id="annotate-help-btn" title="Help" style="margin-left:4px;">? Help</button>
           <button class="btn btn-sm" id="btn-re-sync" title="Go back to sync screen" style="margin-left:4px;">Re-sync</button>
         </div>

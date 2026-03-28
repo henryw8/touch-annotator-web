@@ -69,6 +69,18 @@ let pendingCalibration   = null;      // { start, end, videoIdx } awaiting popov
 let measureMode          = false;
 let measureFirstClick    = null;      // {x, y, videoIdx} normalized
 
+// Ball trajectory tracking state
+let trackMode            = false;
+let trackVideoIdx        = null;       // which video is being tracked
+let trackTemplate        = null;       // { data: Float32Array, w, h } grayscale template patch
+let trackTemplateSize    = 40;         // half-size of template in pixels (80×80 patch)
+let trackSearchRadius    = 60;         // search window radius beyond template
+let trackGroundY         = null;       // normalized Y coordinate of ground plane
+let trajectory           = [];         // [{ frame, masterTime, normX, normY, heightM }]
+let trackBusy            = false;      // true during auto-tracking
+let selectingGround      = false;      // true when waiting for ground click
+let trackScratchCanvas   = null;       // OffscreenCanvas for pixel extraction
+
 // Zoom/pan state per video
 const zoomStates = new Map(); // videoIdx → { scale, panX, panY, container }
 let activePan    = null;      // { videoIdx, startX, startY, startPanX, startPanY, cell }
@@ -700,6 +712,66 @@ function buildAnnotateScreen() {
   });
   document.getElementById('cal-close').addEventListener('click', () => toggleCalibrateMode(false));
 
+  // Build track toolbar (separate from draw/calibrate)
+  let trackToolbar = document.getElementById('track-toolbar');
+  if (trackToolbar) trackToolbar.remove();
+  trackToolbar = document.createElement('div');
+  trackToolbar.id = 'track-toolbar';
+  trackToolbar.className = 'draw-toolbar';  // reuse draw-toolbar styling
+  trackToolbar.innerHTML = `
+    <span id="track-status" style="font-size:12px;color:var(--text-dim);">Click ball to set template</span>
+    <div class="draw-sep"></div>
+    <label style="font-size:11px;color:var(--text-dim);display:flex;align-items:center;gap:3px;">
+      Size <input type="number" id="track-tpl-size" value="${trackTemplateSize}" min="10" max="200" step="5"
+             style="width:48px;padding:3px 5px;background:var(--surface2);border:1px solid var(--border);border-radius:4px;color:var(--text);font-size:12px;">
+    </label>
+    <label style="font-size:11px;color:var(--text-dim);display:flex;align-items:center;gap:3px;">
+      Search <input type="number" id="track-search-radius" value="${trackSearchRadius}" min="20" max="300" step="10"
+               style="width:48px;padding:3px 5px;background:var(--surface2);border:1px solid var(--border);border-radius:4px;color:var(--text);font-size:12px;">
+    </label>
+    <div class="draw-sep"></div>
+    <button class="btn btn-sm" id="track-set-ground" title="Click ground level on video (G)">Set Ground</button>
+    <button class="btn btn-sm" id="track-forward" title="Track ball forward (F)">▶ Forward</button>
+    <button class="btn btn-sm" id="track-backward" title="Track ball backward (R)">◀ Backward</button>
+    <div class="draw-sep"></div>
+    <div class="track-progress" id="track-progress" style="display:none;">
+      <div class="track-progress-bar" id="track-progress-bar"></div>
+    </div>
+    <button class="btn btn-sm" id="track-stop" style="display:none;">Stop</button>
+    <button class="btn btn-sm" id="track-export">Export Traj.</button>
+    <button class="btn btn-sm" id="track-clear">Clear</button>
+    <button class="btn btn-sm" id="track-close">✕</button>
+  `;
+  annotateMain.insertBefore(trackToolbar, videoGrid);
+
+  document.getElementById('track-tpl-size').addEventListener('change', e => {
+    const val = parseInt(e.target.value);
+    if (val > 0) trackTemplateSize = val;
+  });
+  document.getElementById('track-search-radius').addEventListener('change', e => {
+    const val = parseInt(e.target.value);
+    if (val > 0) trackSearchRadius = val;
+  });
+  document.getElementById('track-set-ground').addEventListener('click', () => {
+    selectingGround = true;
+    showToast('Click the ground level on the video');
+  });
+  document.getElementById('track-forward').addEventListener('click', () => trackInDirection('forward'));
+  document.getElementById('track-backward').addEventListener('click', () => trackInDirection('backward'));
+  document.getElementById('track-stop').addEventListener('click', () => { trackBusy = false; });
+  document.getElementById('track-export').addEventListener('click', exportTrajectory);
+  document.getElementById('track-clear').addEventListener('click', () => {
+    if (trajectory.length === 0) { showToast('No trajectory to clear'); return; }
+    trajectory = [];
+    trackTemplate = null;
+    trackGroundY = null;
+    trackVideoIdx = null;
+    updateTrackStatus();
+    redrawAllCanvases();
+    showToast('Trajectory cleared');
+  });
+  document.getElementById('track-close').addEventListener('click', () => toggleTrackMode(false));
+
   // Init canvases + ResizeObserver
   initDrawingCanvases();
 
@@ -749,6 +821,7 @@ function updateTransportUI() {
   timeDisplay.textContent  = `${masterTime.toFixed(3)} s  (real ${toRealTime(masterTime).toFixed(3)} s)`;
   masterScrubber.value     = masterTime;
   highlightCurrentRow();
+  if (trajectory.length > 0 && !isPlaying) redrawAllCanvases();
 }
 
 // ── Playback ─────────────────────────────────────────────
@@ -1517,9 +1590,25 @@ document.addEventListener('keydown', e => {
     case 'D':
       toggleDrawingMode();
       break;
+    case 'b':
+    case 'B':
+      toggleTrackMode();
+      break;
     case 'f':
     case 'F':
+      if (trackMode && trackTemplate && !trackBusy) { trackInDirection('forward'); break; }
       if (drawingMode) setDrawTool('free');
+      break;
+    case 'r':
+    case 'R':
+      if (trackMode && trackTemplate && !trackBusy) trackInDirection('backward');
+      break;
+    case 'g':
+    case 'G':
+      if (trackMode) {
+        selectingGround = true;
+        showToast('Click the ground level on the video');
+      }
       break;
     case 'l':
     case 'L':
@@ -1538,7 +1627,17 @@ document.addEventListener('keydown', e => {
       if (drawingMode) deleteSelectedDrawing();
       break;
     case 'Escape':
-      if (measureMode) {
+      if (trackMode && trackBusy) {
+        e.preventDefault();
+        trackBusy = false;
+      } else if (trackMode) {
+        e.preventDefault();
+        if (selectingGround) {
+          selectingGround = false;
+        } else {
+          toggleTrackMode(false);
+        }
+      } else if (measureMode) {
         e.preventDefault();
         exitMeasureMode();
       } else if (pendingCalibration) {
@@ -1607,8 +1706,9 @@ function toggleDrawingMode(forceState) {
   const btn = document.getElementById('btn-draw');
   if (drawingMode) {
     btn.classList.add('btn-primary');
-    // Exit calibrate mode if active (mutually exclusive)
+    // Exit other modes if active (mutually exclusive)
     if (calibrateMode) toggleCalibrateMode(false);
+    if (trackMode) toggleTrackMode(false);
   } else {
     btn.classList.remove('btn-primary');
     lineStartPoint = null;
@@ -1628,7 +1728,7 @@ function toggleDrawingMode(forceState) {
   // Update zoom cursors
   zoomStates.forEach(state => {
     const cell = state.container.parentElement;
-    cell.style.cursor = (!drawingMode && !calibrateMode && state.scale > 1) ? 'grab' : '';
+    cell.style.cursor = (!drawingMode && !calibrateMode && !trackMode && state.scale > 1) ? 'grab' : '';
   });
 
   redrawAllCanvases();
@@ -1640,8 +1740,9 @@ function toggleCalibrateMode(forceState) {
   const btn = document.getElementById('btn-calibrate');
   if (calibrateMode) {
     btn.classList.add('btn-primary');
-    // Exit draw mode if active (mutually exclusive)
+    // Exit other modes if active (mutually exclusive)
     if (drawingMode) toggleDrawingMode(false);
+    if (trackMode) toggleTrackMode(false);
   } else {
     btn.classList.remove('btn-primary');
     calibStartPoint = null;
@@ -1667,7 +1768,7 @@ function toggleCalibrateMode(forceState) {
   // Update zoom cursors
   zoomStates.forEach(state => {
     const cell = state.container.parentElement;
-    cell.style.cursor = (!drawingMode && !calibrateMode && state.scale > 1) ? 'grab' : '';
+    cell.style.cursor = (!drawingMode && !calibrateMode && !trackMode && state.scale > 1) ? 'grab' : '';
   });
 
   redrawAllCanvases();
@@ -1737,7 +1838,7 @@ function setupCanvasEvents(canvas, videoIdx) {
   let currentStroke = null; // freehand points being drawn
 
   canvas.addEventListener('mousedown', e => {
-    if (!drawingMode && !measureMode && !calibrateMode) return;
+    if (!drawingMode && !measureMode && !calibrateMode && !trackMode) return;
     const rect = canvas.getBoundingClientRect();
     const px = { x: e.clientX - rect.left, y: e.clientY - rect.top };
     const norm = { x: px.x / rect.width, y: px.y / rect.height };
@@ -1752,7 +1853,7 @@ function setupCanvasEvents(canvas, videoIdx) {
   });
 
   canvas.addEventListener('mousemove', e => {
-    if (!drawingMode && !measureMode && !calibrateMode) return;
+    if (!drawingMode && !measureMode && !calibrateMode && !trackMode) return;
     const rect = canvas.getBoundingClientRect();
     const px = { x: e.clientX - rect.left, y: e.clientY - rect.top };
     const norm = { x: px.x / rect.width, y: px.y / rect.height };
@@ -1806,10 +1907,19 @@ function setupCanvasEvents(canvas, videoIdx) {
   });
 
   canvas.addEventListener('mouseup', e => {
-    if (!drawingMode && !measureMode && !calibrateMode) return;
+    if (!drawingMode && !measureMode && !calibrateMode && !trackMode) return;
     const rect = canvas.getBoundingClientRect();
     const px = { x: e.clientX - rect.left, y: e.clientY - rect.top };
     const norm = { x: px.x / rect.width, y: px.y / rect.height };
+
+    // Handle tracking clicks
+    if (trackMode && !isDragging) {
+      handleTrackClick(videoIdx, norm);
+      currentStroke = null;
+      dragStartPx = null;
+      isDragging = false;
+      return;
+    }
 
     // Handle measurement clicks first
     if (measureMode && !isDragging) {
@@ -1963,11 +2073,12 @@ function redrawCanvas(videoIdx) {
   const hasMeasureState = measureFirstClick && measureFirstClick.videoIdx === videoIdx;
 
   // Hide canvas when not needed — avoids browser compositing issues with video
+  const hasTrajectory = trajectory.length > 0 && trackVideoIdx === videoIdx;
   const hasContent = elements.length > 0
     || (lineStartPoint && lineStartVideoIdx === videoIdx)
     || (calibStartPoint && calibStartVideoIdx === videoIdx)
-    || (cal && showCalibrationLines) || hasMeasureState;
-  const needsCanvas = drawingMode || measureMode || calibrateMode || hasContent;
+    || (cal && showCalibrationLines) || hasMeasureState || hasTrajectory;
+  const needsCanvas = drawingMode || measureMode || calibrateMode || trackMode || hasContent;
   canvas.style.display = needsCanvas ? '' : 'none';
   if (!needsCanvas) return;
 
@@ -2011,6 +2122,11 @@ function redrawCanvas(videoIdx) {
     ctx.beginPath();
     ctx.arc(measureFirstClick.x * canvas.width, measureFirstClick.y * canvas.height, 5, 0, Math.PI * 2);
     ctx.fill();
+  }
+
+  // Draw trajectory overlay
+  if (hasTrajectory) {
+    drawTrajectory(ctx, canvas, trajectory);
   }
 }
 
@@ -2207,9 +2323,428 @@ function handleMeasureClick(videoIdx, norm) {
   }
 }
 
+// ═══════════════════════════════════════════════════════════
+// BALL TRAJECTORY TRACKING
+// ═══════════════════════════════════════════════════════════
+
+function toggleTrackMode(forceState) {
+  trackMode = forceState !== undefined ? forceState : !trackMode;
+
+  const btn = document.getElementById('btn-track');
+  if (trackMode) {
+    btn.classList.add('btn-primary');
+    if (drawingMode) toggleDrawingMode(false);
+    if (calibrateMode) toggleCalibrateMode(false);
+  } else {
+    btn.classList.remove('btn-primary');
+    selectingGround = false;
+  }
+
+  const toolbar = document.getElementById('track-toolbar');
+  if (toolbar) toolbar.classList.toggle('visible', trackMode);
+
+  drawingData.forEach(data => {
+    if (trackMode) {
+      data.canvas.classList.add('track-active');
+    } else {
+      data.canvas.classList.remove('track-active');
+      if (!drawingMode && !calibrateMode) data.canvas.classList.remove('active');
+    }
+  });
+
+  zoomStates.forEach(state => {
+    const cell = state.container.parentElement;
+    cell.style.cursor = (!drawingMode && !calibrateMode && !trackMode && state.scale > 1) ? 'grab' : '';
+  });
+
+  redrawAllCanvases();
+}
+
+function updateTrackStatus() {
+  const el = document.getElementById('track-status');
+  if (!el) return;
+  if (trackBusy) return; // status updated by tracking loop
+  if (trajectory.length === 0) {
+    el.textContent = trackTemplate ? 'Template set — click Forward/Backward' : 'Click ball to set template';
+  } else {
+    el.textContent = `${trajectory.length} points tracked`;
+  }
+}
+
+function ensureScratchCanvas(videoEl) {
+  const vw = videoEl.videoWidth;
+  const vh = videoEl.videoHeight;
+  if (!trackScratchCanvas || trackScratchCanvas.width !== vw || trackScratchCanvas.height !== vh) {
+    trackScratchCanvas = new OffscreenCanvas(vw, vh);
+  }
+  return trackScratchCanvas;
+}
+
+function extractGrayscalePatch(scratchCtx, cx, cy, halfSize, vw, vh) {
+  const x0 = Math.max(0, Math.round(cx - halfSize));
+  const y0 = Math.max(0, Math.round(cy - halfSize));
+  const x1 = Math.min(vw, Math.round(cx + halfSize));
+  const y1 = Math.min(vh, Math.round(cy + halfSize));
+  const w = x1 - x0;
+  const h = y1 - y0;
+  if (w <= 0 || h <= 0) return null;
+
+  const imageData = scratchCtx.getImageData(x0, y0, w, h);
+  const pixels = imageData.data;
+  const gray = new Float32Array(w * h);
+  for (let i = 0; i < gray.length; i++) {
+    gray[i] = pixels[i * 4]; // BW video: R channel is sufficient
+  }
+  return { data: gray, w, h, ox: x0, oy: y0 };
+}
+
+function computeNCC(template, tW, tH, search, sW, sH) {
+  // Pre-compute template stats
+  let tMean = 0;
+  for (let i = 0; i < template.length; i++) tMean += template[i];
+  tMean /= template.length;
+
+  let tVar = 0;
+  for (let i = 0; i < template.length; i++) {
+    const d = template[i] - tMean;
+    tVar += d * d;
+  }
+  if (tVar < 1e-6) return { bestX: 0, bestY: 0, bestScore: 0 };
+  const tStd = Math.sqrt(tVar);
+
+  let bestScore = -2;
+  let bestX = 0, bestY = 0;
+
+  const maxTy = sH - tH;
+  const maxTx = sW - tW;
+
+  for (let sy = 0; sy <= maxTy; sy++) {
+    for (let sx = 0; sx <= maxTx; sx++) {
+      // Compute patch mean
+      let pMean = 0;
+      for (let ty = 0; ty < tH; ty++) {
+        const sRow = (sy + ty) * sW + sx;
+        for (let tx = 0; tx < tW; tx++) {
+          pMean += search[sRow + tx];
+        }
+      }
+      pMean /= template.length;
+
+      // Compute NCC
+      let num = 0, pVar = 0;
+      for (let ty = 0; ty < tH; ty++) {
+        const sRow = (sy + ty) * sW + sx;
+        const tRow = ty * tW;
+        for (let tx = 0; tx < tW; tx++) {
+          const td = template[tRow + tx] - tMean;
+          const pd = search[sRow + tx] - pMean;
+          num += td * pd;
+          pVar += pd * pd;
+        }
+      }
+
+      if (pVar < 1e-6) continue;
+      const score = num / (tStd * Math.sqrt(pVar));
+
+      if (score > bestScore) {
+        bestScore = score;
+        bestX = sx;
+        bestY = sy;
+      }
+    }
+  }
+
+  return { bestX, bestY, bestScore };
+}
+
+function seekAndCapture(videoEl, targetTime) {
+  return new Promise(resolve => {
+    if (Math.abs(videoEl.currentTime - targetTime) < 0.0001) {
+      resolve();
+      return;
+    }
+    videoEl.addEventListener('seeked', () => resolve(), { once: true });
+    videoEl.currentTime = targetTime;
+  });
+}
+
+function handleTrackClick(videoIdx, norm) {
+  if (selectingGround) {
+    trackGroundY = norm.y;
+    selectingGround = false;
+    // Recompute heights for existing trajectory
+    recomputeTrajectoryHeights();
+    redrawAllCanvases();
+    showToast(`Ground level set at y=${(norm.y * 100).toFixed(1)}%`);
+    return;
+  }
+
+  const videoEl = videoItems[videoIdx].el;
+  const vw = videoEl.videoWidth;
+  const vh = videoEl.videoHeight;
+
+  // Capture template from current video frame
+  const scratch = ensureScratchCanvas(videoEl);
+  const sctx = scratch.getContext('2d');
+  sctx.drawImage(videoEl, 0, 0, vw, vh);
+
+  const cx = norm.x * vw;
+  const cy = norm.y * vh;
+  const patch = extractGrayscalePatch(sctx, cx, cy, trackTemplateSize, vw, vh);
+  if (!patch) { showToast('Could not capture template'); return; }
+
+  trackTemplate = { data: patch.data, w: patch.w, h: patch.h };
+  trackVideoIdx = videoIdx;
+
+  // Add or update the current frame in trajectory
+  const frame = Math.round(masterTime * masterFPS);
+  const existing = trajectory.findIndex(p => p.frame === frame);
+  const pt = {
+    frame,
+    masterTime,
+    normX: norm.x,
+    normY: norm.y,
+    heightM: computeTrackHeight(videoIdx, norm),
+  };
+  if (existing >= 0) {
+    trajectory[existing] = pt;
+  } else {
+    trajectory.push(pt);
+    trajectory.sort((a, b) => a.frame - b.frame);
+  }
+
+  updateTrackStatus();
+  redrawAllCanvases();
+  showToast('Template captured — use Forward/Backward to track');
+}
+
+function computeTrackHeight(videoIdx, normPos) {
+  if (trackGroundY === null) return null;
+  const cal = calibrations.get(videoIdx);
+  if (!cal) return null;
+  const groundPt = { x: normPos.x, y: trackGroundY };
+  return computeHeight(videoIdx, groundPt, normPos);
+}
+
+function recomputeTrajectoryHeights() {
+  if (trackVideoIdx === null) return;
+  for (const pt of trajectory) {
+    pt.heightM = computeTrackHeight(trackVideoIdx, { x: pt.normX, y: pt.normY });
+  }
+}
+
+async function trackInDirection(direction) {
+  if (trackBusy) return;
+  if (!trackTemplate) { showToast('Click the ball first to set a template'); return; }
+  if (trackVideoIdx === null) return;
+
+  trackBusy = true;
+  const statusEl = document.getElementById('track-status');
+  const progressWrap = document.getElementById('track-progress');
+  const progressBar = document.getElementById('track-progress-bar');
+  const stopBtn = document.getElementById('track-stop');
+  if (progressWrap) progressWrap.style.display = '';
+  if (stopBtn) stopBtn.style.display = '';
+
+  const step = direction === 'forward' ? 1 / masterFPS : -1 / masterFPS;
+  const limit = direction === 'forward' ? masterMax : masterMin;
+  const videoEl = videoItems[trackVideoIdx].el;
+  const vw = videoEl.videoWidth;
+  const vh = videoEl.videoHeight;
+  const syncOff = videoItems[trackVideoIdx].syncOffset;
+
+  const scratch = ensureScratchCanvas(videoEl);
+  const sctx = scratch.getContext('2d');
+
+  // Find last known position in the tracking direction
+  const currentFrame = Math.round(masterTime * masterFPS);
+  let lastPt = trajectory.find(p => p.frame === currentFrame);
+  if (!lastPt && trajectory.length > 0) {
+    // Find closest point
+    lastPt = trajectory.reduce((best, p) =>
+      Math.abs(p.frame - currentFrame) < Math.abs(best.frame - currentFrame) ? p : best
+    );
+  }
+  if (!lastPt) { trackBusy = false; showToast('No starting point'); return; }
+
+  let lastPx = { x: lastPt.normX * vw, y: lastPt.normY * vh };
+  let t = lastPt.masterTime + step;
+  let frameCount = 0;
+  const totalFrames = Math.abs((limit - lastPt.masterTime) * masterFPS);
+
+  while (trackBusy && (direction === 'forward' ? t <= limit : t >= limit)) {
+    const videoTime = t + syncOff;
+    if (videoTime < 0 || videoTime > videoEl.duration) break;
+
+    await seekAndCapture(videoEl, videoTime);
+    sctx.drawImage(videoEl, 0, 0, vw, vh);
+
+    // Extract search region around last known position
+    const searchHalf = trackTemplateSize + trackSearchRadius;
+    const searchPatch = extractGrayscalePatch(sctx, lastPx.x, lastPx.y, searchHalf, vw, vh);
+    if (!searchPatch) break;
+
+    // Run NCC
+    const match = computeNCC(
+      trackTemplate.data, trackTemplate.w, trackTemplate.h,
+      searchPatch.data, searchPatch.w, searchPatch.h
+    );
+
+    if (match.bestScore < 0.5) {
+      showToast(`Tracking lost at frame ${Math.round(t * masterFPS)} (score: ${match.bestScore.toFixed(2)})`);
+      break;
+    }
+
+    // Convert match position back to video pixel coords
+    // match.bestX/Y is top-left of best match within search patch
+    // Center of match = bestX + templateW/2, bestY + templateH/2, relative to search patch origin
+    const matchCx = searchPatch.ox + match.bestX + trackTemplate.w / 2;
+    const matchCy = searchPatch.oy + match.bestY + trackTemplate.h / 2;
+    const normX = matchCx / vw;
+    const normY = matchCy / vh;
+
+    const frame = Math.round(t * masterFPS);
+    const existingIdx = trajectory.findIndex(p => p.frame === frame);
+    const pt = {
+      frame,
+      masterTime: t,
+      normX,
+      normY,
+      heightM: computeTrackHeight(trackVideoIdx, { x: normX, y: normY }),
+    };
+    if (existingIdx >= 0) {
+      trajectory[existingIdx] = pt;
+    } else {
+      trajectory.push(pt);
+    }
+
+    lastPx = { x: matchCx, y: matchCy };
+    t += step;
+    frameCount++;
+
+    // Update UI periodically
+    if (frameCount % 30 === 0) {
+      trajectory.sort((a, b) => a.frame - b.frame);
+      if (statusEl) statusEl.textContent = `Tracking: ${frameCount} frames (score: ${match.bestScore.toFixed(2)})`;
+      if (progressBar) progressBar.style.width = `${Math.min(100, (frameCount / totalFrames) * 100)}%`;
+      seekToMaster(t);
+      redrawAllCanvases();
+      await new Promise(r => setTimeout(r, 0));
+    }
+  }
+
+  trajectory.sort((a, b) => a.frame - b.frame);
+  trackBusy = false;
+  if (progressWrap) progressWrap.style.display = 'none';
+  if (stopBtn) stopBtn.style.display = 'none';
+  if (progressBar) progressBar.style.width = '0%';
+  updateTrackStatus();
+  seekToMaster(t - step); // stay at last tracked frame
+  redrawAllCanvases();
+  showToast(`Tracked ${frameCount} frames ${direction}`);
+}
+
+function drawTrajectory(ctx, canvas, traj) {
+  const W = canvas.width, H = canvas.height;
+  if (traj.length === 0) return;
+
+  ctx.save();
+
+  // Draw ground reference line
+  if (trackGroundY !== null) {
+    ctx.strokeStyle = 'rgba(74, 255, 138, 0.3)';
+    ctx.lineWidth = 1;
+    ctx.setLineDash([4, 4]);
+    ctx.beginPath();
+    ctx.moveTo(0, trackGroundY * H);
+    ctx.lineTo(W, trackGroundY * H);
+    ctx.stroke();
+    ctx.setLineDash([]);
+  }
+
+  // Draw connecting line
+  ctx.strokeStyle = 'rgba(255, 204, 68, 0.5)';
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  for (let i = 0; i < traj.length; i++) {
+    const px = traj[i].normX * W;
+    const py = traj[i].normY * H;
+    if (i === 0) ctx.moveTo(px, py);
+    else ctx.lineTo(px, py);
+  }
+  ctx.stroke();
+
+  // Draw dots
+  for (const pt of traj) {
+    ctx.fillStyle = '#ffcc44';
+    ctx.beginPath();
+    ctx.arc(pt.normX * W, pt.normY * H, 2, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  // Highlight current frame's point
+  const currentFrame = Math.round(masterTime * masterFPS);
+  const currentPt = traj.find(p => p.frame === currentFrame);
+  if (currentPt) {
+    ctx.strokeStyle = '#ff4a6a';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.arc(currentPt.normX * W, currentPt.normY * H, 6, 0, Math.PI * 2);
+    ctx.stroke();
+  }
+
+  ctx.restore();
+}
+
+function exportTrajectory() {
+  if (trajectory.length === 0) { showToast('No trajectory to export'); return; }
+  if (trackVideoIdx === null) return;
+
+  const videoEl = videoItems[trackVideoIdx].el;
+  const vw = videoEl.videoWidth;
+  const vh = videoEl.videoHeight;
+  const cal = calibrations.get(trackVideoIdx);
+  const item = videoItems[trackVideoIdx];
+
+  const metaObj = {
+    videos: [{ name: item.name, syncOffset: item.syncOffset, fps: item.fps }],
+    realTimeFactor,
+    calibration: cal ? { realHeight: cal.realHeight, unit: cal.unit } : null,
+    groundY: trackGroundY,
+    templateSize: trackTemplateSize,
+  };
+
+  const headers = ['frame', 'time_s', 'real_time_s', 'norm_x', 'norm_y', 'pixel_x', 'pixel_y', 'height', 'height_unit'];
+  const dataRows = trajectory.map(pt => [
+    pt.frame,
+    pt.masterTime.toFixed(6),
+    toRealTime(pt.masterTime).toFixed(6),
+    pt.normX.toFixed(6),
+    pt.normY.toFixed(6),
+    Math.round(pt.normX * vw),
+    Math.round(pt.normY * vh),
+    pt.heightM != null ? pt.heightM.toFixed(4) : '',
+    cal ? cal.unit : '',
+  ]);
+
+  const metaLine = '#meta ' + JSON.stringify(metaObj);
+  const csv = metaLine + '\r\n' + [headers, ...dataRows].map(r => r.join(',')).join('\r\n');
+  const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+  const url = URL.createObjectURL(blob);
+
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `trajectory_${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')}.csv`;
+  a.click();
+  URL.revokeObjectURL(url);
+
+  showToast(`Exported ${trajectory.length} trajectory points`);
+}
+
 // Draw button event
 $('btn-draw').addEventListener('click', () => toggleDrawingMode());
 $('btn-calibrate').addEventListener('click', () => toggleCalibrateMode());
+$('btn-track').addEventListener('click', () => toggleTrackMode());
 
 // Height section event listeners
 $('btn-measure').addEventListener('click', () => {
@@ -2442,6 +2977,25 @@ const HELP_CONTENT = {
           <li data-n="5">Click the ground level, then the ball position on the calibrated video. The height is computed automatically.</li>
         </ol>
         <p style="margin-top:6px;">You can also type a height value manually. One calibration per video (new calibration replaces old). Use <strong>Hide Lines</strong> / <strong>Clear All</strong> in the calibrate toolbar to manage calibration visuals.</p>
+      </div>
+      <div class="help-section">
+        <h3>Ball trajectory tracking</h3>
+        <ol class="help-steps">
+          <li data-n="1">Calibrate a reference height first (press <strong>C</strong>).</li>
+          <li data-n="2">Press <strong>B</strong> or click <strong>⊙ Track</strong> to enter tracking mode.</li>
+          <li data-n="3">Click the ball to capture a template patch.</li>
+          <li data-n="4">Press <strong>G</strong> or click <strong>Set Ground</strong>, then click the ground level.</li>
+          <li data-n="5">Press <strong>F</strong> to track forward or <strong>R</strong> to track backward. The tracker uses NCC template matching to follow the ball frame-by-frame.</li>
+          <li data-n="6">Click <strong>Export Traj.</strong> to save the trajectory as CSV.</li>
+        </ol>
+        <table class="help-keys" style="margin-top:8px;">
+          <tr><td><span class="kbd">B</span></td><td>Toggle tracking mode</td></tr>
+          <tr><td><span class="kbd">F</span></td><td>Track forward (in track mode)</td></tr>
+          <tr><td><span class="kbd">R</span></td><td>Track backward</td></tr>
+          <tr><td><span class="kbd">G</span></td><td>Set ground level</td></tr>
+          <tr><td><span class="kbd">Esc</span></td><td>Stop tracking / exit track mode</td></tr>
+        </table>
+        <p style="margin-top:6px;">Click on the ball at any time to reposition the template and correct tracking errors. Adjust <strong>Size</strong> (template half-size in pixels) and <strong>Search</strong> (search radius) in the toolbar for your video.</p>
       </div>
       <div class="help-section">
         <h3>Zoom &amp; Pan</h3>
