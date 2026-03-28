@@ -2391,106 +2391,76 @@ function extractGrayscalePatch(scratchCtx, cx, cy, halfSize, vw, vh) {
   return { data: gray, w, h, ox: x0, oy: y0 };
 }
 
-// ── Ball detection: threshold + flood fill ──
+// ── Ball detection: radial intensity profile ──
+// For each radius r from the seed, compute the average intensity on a circle.
+// The ball edge is where this average drops (or rises) most steeply.
+// This naturally averages over ball markings/texture and cannot leak.
 
-function otsuThreshold(gray) {
-  const hist = new Int32Array(256);
-  for (let i = 0; i < gray.length; i++) hist[Math.min(255, Math.max(0, Math.round(gray[i])))]++;
+function detectBallRadial(gray, w, h, seedX, seedY) {
+  const cx = Math.round(Math.max(0, Math.min(w - 1, seedX)));
+  const cy = Math.round(Math.max(0, Math.min(h - 1, seedY)));
 
-  const total = gray.length;
-  let sumAll = 0;
-  for (let i = 0; i < 256; i++) sumAll += i * hist[i];
+  const maxR = Math.floor(Math.min(cx, cy, w - 1 - cx, h - 1 - cy) * 0.95);
+  if (maxR < 5) return null;
 
-  let bestThresh = 128, bestVar = 0;
-  let sumBg = 0, countBg = 0;
-
-  for (let t = 0; t < 256; t++) {
-    countBg += hist[t];
-    if (countBg === 0) continue;
-    const countFg = total - countBg;
-    if (countFg === 0) break;
-
-    sumBg += t * hist[t];
-    const meanBg = sumBg / countBg;
-    const meanFg = (sumAll - sumBg) / countFg;
-    const v = countBg * countFg * (meanBg - meanFg) ** 2;
-    if (v > bestVar) { bestVar = v; bestThresh = t; }
-  }
-  return bestThresh;
-}
-
-function detectBallBlob(gray, w, h, seedX, seedY) {
-  const sx = Math.round(Math.max(0, Math.min(w - 1, seedX)));
-  const sy = Math.round(Math.max(0, Math.min(h - 1, seedY)));
-  const seedVal = gray[sy * w + sx];
-
-  // Sample border to determine ball vs background polarity
-  let borderSum = 0, borderN = 0;
-  for (let x = 0; x < w; x++) { borderSum += gray[x] + gray[(h - 1) * w + x]; borderN += 2; }
-  for (let y = 1; y < h - 1; y++) { borderSum += gray[y * w] + gray[y * w + w - 1]; borderN += 2; }
-  const borderMean = borderSum / borderN;
-  const ballIsDark = seedVal < borderMean;
-
-  const thresh = otsuThreshold(gray);
-
-  // Binary mask: 1 = ball pixel
-  const binary = new Uint8Array(w * h);
-  for (let i = 0; i < gray.length; i++) {
-    binary[i] = ballIsDark ? (gray[i] <= thresh ? 1 : 0) : (gray[i] > thresh ? 1 : 0);
-  }
-
-  // Find seed in the ball — if click isn't on ball, spiral outward
-  let startIdx = sy * w + sx;
-  if (!binary[startIdx]) {
-    let found = false;
-    for (let r = 1; r < Math.min(w, h) / 2 && !found; r++) {
-      const steps = Math.max(8, r * 4);
-      for (let i = 0; i < steps; i++) {
-        const angle = (2 * Math.PI * i) / steps;
-        const nx = Math.round(sx + r * Math.cos(angle));
-        const ny = Math.round(sy + r * Math.sin(angle));
-        if (nx >= 0 && nx < w && ny >= 0 && ny < h && binary[ny * w + nx]) {
-          startIdx = ny * w + nx;
-          found = true;
-          break;
-        }
+  // Compute circular average intensity at each radius
+  const avgs = new Float32Array(maxR + 1);
+  avgs[0] = gray[cy * w + cx];
+  for (let r = 1; r <= maxR; r++) {
+    const n = Math.max(16, Math.round(2 * Math.PI * r));
+    let sum = 0, cnt = 0;
+    for (let i = 0; i < n; i++) {
+      const angle = (2 * Math.PI * i) / n;
+      const px = Math.round(cx + r * Math.cos(angle));
+      const py = Math.round(cy + r * Math.sin(angle));
+      if (px >= 0 && px < w && py >= 0 && py < h) {
+        sum += gray[py * w + px];
+        cnt++;
       }
     }
-    if (!found) return null;
+    avgs[r] = cnt > 0 ? sum / cnt : avgs[r - 1];
   }
 
-  // Flood fill
-  const visited = new Uint8Array(w * h);
-  const stack = [startIdx];
-  let sumX = 0, sumY = 0, count = 0;
-  let minY = h, maxY = 0;
+  // Polarity: is the ball brighter or darker than background?
+  const ballIsBright = avgs[0] > avgs[maxR];
 
-  while (stack.length > 0) {
-    const idx = stack.pop();
-    if (visited[idx]) continue;
-    visited[idx] = 1;
-
-    const px = idx % w;
-    const py = (idx - px) / w;
-    sumX += px;
-    sumY += py;
-    if (py < minY) minY = py;
-    if (py > maxY) maxY = py;
-    count++;
-
-    if (px > 0     && binary[idx - 1] && !visited[idx - 1]) stack.push(idx - 1);
-    if (px < w - 1 && binary[idx + 1] && !visited[idx + 1]) stack.push(idx + 1);
-    if (py > 0     && binary[idx - w] && !visited[idx - w]) stack.push(idx - w);
-    if (py < h - 1 && binary[idx + w] && !visited[idx + w]) stack.push(idx + w);
+  // Find radius with steepest intensity change (gap of 3px)
+  const gap = 3;
+  let bestR = -1, bestDelta = 0;
+  for (let r = gap + 1; r <= maxR; r++) {
+    const delta = ballIsBright
+      ? (avgs[r - gap] - avgs[r])
+      : (avgs[r] - avgs[r - gap]);
+    if (delta > bestDelta) {
+      bestDelta = delta;
+      bestR = r - Math.floor(gap / 2);
+    }
   }
 
-  if (count < 10) return null;
+  if (bestR < 3 || bestDelta < 3) return null;
 
-  const blobCx = sumX / count;
-  const blobCy = sumY / count;
-  const radius = Math.sqrt(count / Math.PI);
+  // Refine center: compute centroid of ball-like pixels within detected radius
+  const ballAvg = avgs[Math.max(1, Math.round(bestR * 0.3))];
+  const bgAvg = avgs[maxR];
+  const thresh = (ballAvg + bgAvg) / 2;
 
-  return { cx: blobCx, cy: blobCy, radius, area: count, topY: minY };
+  let sumX = 0, sumY = 0, cnt = 0;
+  const rSq = bestR * bestR;
+  for (let dy = -bestR; dy <= bestR; dy++) {
+    for (let dx = -bestR; dx <= bestR; dx++) {
+      if (dx * dx + dy * dy > rSq) continue;
+      const px = cx + dx, py = cy + dy;
+      if (px < 0 || px >= w || py < 0 || py >= h) continue;
+      const v = gray[py * w + px];
+      const isBall = ballIsBright ? (v >= thresh) : (v <= thresh);
+      if (isBall) { sumX += px; sumY += py; cnt++; }
+    }
+  }
+
+  const finalCx = cnt > 10 ? sumX / cnt : seedX;
+  const finalCy = cnt > 10 ? sumY / cnt : seedY;
+
+  return { cx: finalCx, cy: finalCy, radius: bestR, topY: finalCy - bestR };
 }
 
 function detectBallAtPosition(videoIdx, searchCenterPx) {
@@ -2506,22 +2476,20 @@ function detectBallAtPosition(videoIdx, searchCenterPx) {
   const patch = extractGrayscalePatch(sctx, searchCenterPx.x, searchCenterPx.y, searchHalf, vw, vh);
   if (!patch) return null;
 
-  // Seed point is the center of the patch (= previous ball position)
   const localSeedX = searchCenterPx.x - patch.ox;
   const localSeedY = searchCenterPx.y - patch.oy;
 
-  const blob = detectBallBlob(patch.data, patch.w, patch.h, localSeedX, localSeedY);
-  if (!blob) return null;
+  const det = detectBallRadial(patch.data, patch.w, patch.h, localSeedX, localSeedY);
+  if (!det) return null;
 
-  // Sanity check: reject if area changed drastically from expected
-  const expectedArea = Math.PI * trackBallRadius * trackBallRadius;
-  if (blob.area < expectedArea * 0.3 || blob.area > expectedArea * 3) return null;
+  // Sanity: reject if radius changed drastically
+  if (det.radius < trackBallRadius * 0.4 || det.radius > trackBallRadius * 2.5) return null;
 
   return {
-    cx: patch.ox + blob.cx,
-    cy: patch.oy + blob.cy,
-    radius: blob.radius,
-    topY: patch.oy + blob.topY,
+    cx: patch.ox + det.cx,
+    cy: patch.oy + det.cy,
+    radius: det.radius,
+    topY: patch.oy + det.topY,
   };
 }
 
@@ -2558,26 +2526,26 @@ function handleTrackClick(videoIdx, norm) {
 
   const clickPx = { x: norm.x * vw, y: norm.y * vh };
 
-  // Detect ball blob around click point
-  const initHalf = 120;
+  // Detect ball via radial intensity profile around click
+  const initHalf = 150;
   const patch = extractGrayscalePatch(sctx, clickPx.x, clickPx.y, initHalf, vw, vh);
   if (!patch) { showToast('Could not read video frame'); return; }
 
   const localX = clickPx.x - patch.ox;
   const localY = clickPx.y - patch.oy;
-  const blob = detectBallBlob(patch.data, patch.w, patch.h, localX, localY);
-  if (!blob || blob.area < 10) {
-    showToast('Could not detect the ball — try clicking directly on it');
+  const det = detectBallRadial(patch.data, patch.w, patch.h, localX, localY);
+  if (!det) {
+    showToast('Could not detect the ball — try clicking on its center');
     return;
   }
 
-  trackBallRadius = blob.radius;
-  trackLastCenter = { x: patch.ox + blob.cx, y: patch.oy + blob.cy };
+  trackBallRadius = det.radius;
+  trackLastCenter = { x: patch.ox + det.cx, y: patch.oy + det.cy };
   trackVideoIdx = videoIdx;
 
   const normCx = trackLastCenter.x / vw;
   const normCy = trackLastCenter.y / vh;
-  const normTopY = (patch.oy + blob.topY) / vh;
+  const normTopY = (patch.oy + det.topY) / vh;
 
   // Add first trajectory point
   const frame = Math.round(masterTime * masterFPS);
