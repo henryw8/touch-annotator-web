@@ -80,7 +80,8 @@ let trajectory           = [];         // [{ frame, masterTime, normCx, normCy, 
 let trackBusy            = false;      // true during auto-tracking
 let selectingGround      = false;      // true when waiting for ground click
 let trackScratchCanvas   = null;       // OffscreenCanvas for pixel extraction
-let trackDragStart       = null;       // {x, y, videoIdx} normalized — mousedown point for circle draw
+let trackDragStart       = null;       // {x, y, videoIdx, origCx, origCy, origR} — mousedown state
+let trackEditMode        = null;       // 'new' | 'move' | 'resize'
 
 // Zoom/pan state per video
 const zoomStates = new Map(); // videoIdx → { scale, panX, panY, container }
@@ -1840,7 +1841,26 @@ function setupCanvasEvents(canvas, videoIdx) {
     currentStroke = null;
 
     if (trackMode && !selectingGround) {
-      trackDragStart = { x: norm.x, y: norm.y, videoIdx };
+      trackEditMode = 'new';
+      let origCx = 0, origCy = 0, origR = 0;
+
+      if (trackBallRadius > 0 && trackLastCenter && trackVideoIdx === videoIdx) {
+        const videoEl = videoItems[videoIdx].el;
+        origCx = trackLastCenter.x / videoEl.videoWidth;
+        origCy = trackLastCenter.y / videoEl.videoHeight;
+        origR = trackBallRadius;
+
+        // Distance from click to center in display pixels
+        const dxD = (norm.x - origCx) * rect.width;
+        const dyD = (norm.y - origCy) * rect.height;
+        const distD = Math.sqrt(dxD * dxD + dyD * dyD);
+        const rD = trackBallRadius * (rect.width / videoEl.videoWidth);
+
+        if (distD < rD * 0.7) trackEditMode = 'move';
+        else if (distD < rD * 1.5) trackEditMode = 'resize';
+      }
+
+      trackDragStart = { x: norm.x, y: norm.y, videoIdx, origCx, origCy, origR };
     }
 
     if (drawingMode && drawToolMode === 'free') {
@@ -1868,11 +1888,32 @@ function setupCanvasEvents(canvas, videoIdx) {
       redrawCanvas(videoIdx);
       const tCtx = drawingData.get(videoIdx).ctx;
       const W = canvas.width, H = canvas.height;
-      const cxPx = trackDragStart.x * W;
-      const cyPx = trackDragStart.y * H;
-      const dx = norm.x * W - cxPx;
-      const dy = norm.y * H - cyPx;
-      const r = Math.sqrt(dx * dx + dy * dy);
+      let cxPx, cyPx, r;
+
+      if (trackEditMode === 'move') {
+        // Center follows mouse delta, radius stays
+        const newCx = trackDragStart.origCx + (norm.x - trackDragStart.x);
+        const newCy = trackDragStart.origCy + (norm.y - trackDragStart.y);
+        cxPx = newCx * W;
+        cyPx = newCy * H;
+        const videoEl = videoItems[videoIdx].el;
+        r = trackDragStart.origR * (W / videoEl.videoWidth);
+      } else if (trackEditMode === 'resize') {
+        // Center stays, radius = distance from center to cursor
+        cxPx = trackDragStart.origCx * W;
+        cyPx = trackDragStart.origCy * H;
+        const dx = norm.x * W - cxPx;
+        const dy = norm.y * H - cyPx;
+        r = Math.sqrt(dx * dx + dy * dy);
+      } else {
+        // New circle: center = start, radius = distance
+        cxPx = trackDragStart.x * W;
+        cyPx = trackDragStart.y * H;
+        const dx = norm.x * W - cxPx;
+        const dy = norm.y * H - cyPx;
+        r = Math.sqrt(dx * dx + dy * dy);
+      }
+
       tCtx.save();
       tCtx.strokeStyle = '#ff4a6a';
       tCtx.lineWidth = 2;
@@ -1880,10 +1921,13 @@ function setupCanvasEvents(canvas, videoIdx) {
       tCtx.beginPath();
       tCtx.arc(cxPx, cyPx, r, 0, Math.PI * 2);
       tCtx.stroke();
-      // Top marker
       tCtx.fillStyle = '#ff4a6a';
       tCtx.beginPath();
       tCtx.arc(cxPx, cyPx - r, 4, 0, Math.PI * 2);
+      tCtx.fill();
+      // Center dot
+      tCtx.beginPath();
+      tCtx.arc(cxPx, cyPx, 3, 0, Math.PI * 2);
       tCtx.fill();
       tCtx.restore();
       return;
@@ -1934,14 +1978,15 @@ function setupCanvasEvents(canvas, videoIdx) {
     const px = { x: e.clientX - rect.left, y: e.clientY - rect.top };
     const norm = { x: px.x / rect.width, y: px.y / rect.height };
 
-    // Handle tracking: drag = draw circle prior, click = ground select
+    // Handle tracking: drag = draw/move/resize circle, click = ground select
     if (trackMode) {
       if (isDragging && trackDragStart && trackDragStart.videoIdx === videoIdx) {
-        handleTrackDrag(videoIdx, trackDragStart, norm);
+        handleTrackDrag(videoIdx, trackDragStart, norm, trackEditMode);
       } else if (!isDragging) {
         handleTrackClick(videoIdx, norm);
       }
       trackDragStart = null;
+      trackEditMode = null;
       currentStroke = null;
       dragStartPx = null;
       isDragging = false;
@@ -2540,29 +2585,43 @@ function seekAndCapture(videoEl, targetTime) {
   });
 }
 
-// ── Drag handler: user draws circle as prior ──
+// ── Drag handler: draw / move / resize circle prior ──
 
-function handleTrackDrag(videoIdx, start, end) {
+function handleTrackDrag(videoIdx, start, end, mode) {
   const videoEl = videoItems[videoIdx].el;
   const vw = videoEl.videoWidth;
   const vh = videoEl.videoHeight;
 
-  // Center = drag start, radius = distance to drag end (in video pixels)
-  const cxPx = start.x * vw;
-  const cyPx = start.y * vh;
-  const dx = (end.x - start.x) * vw;
-  const dy = (end.y - start.y) * vh;
-  const radiusPx = Math.sqrt(dx * dx + dy * dy);
+  let normCx, normCy, radiusPx;
+
+  if (mode === 'move') {
+    // Shift center by mouse delta, keep radius
+    normCx = start.origCx + (end.x - start.x);
+    normCy = start.origCy + (end.y - start.y);
+    radiusPx = start.origR;
+  } else if (mode === 'resize') {
+    // Keep center, radius = distance from center to cursor
+    normCx = start.origCx;
+    normCy = start.origCy;
+    const dx = (end.x - normCx) * vw;
+    const dy = (end.y - normCy) * vh;
+    radiusPx = Math.sqrt(dx * dx + dy * dy);
+  } else {
+    // New circle: center = start, radius = distance to end
+    normCx = start.x;
+    normCy = start.y;
+    const dx = (end.x - start.x) * vw;
+    const dy = (end.y - start.y) * vh;
+    radiusPx = Math.sqrt(dx * dx + dy * dy);
+  }
 
   if (radiusPx < 3) { showToast('Drag further to set ball size'); return; }
 
   trackBallRadius = radiusPx;
-  trackLastCenter = { x: cxPx, y: cyPx };
+  trackLastCenter = { x: normCx * vw, y: normCy * vh };
   trackVideoIdx = videoIdx;
 
-  const normCx = start.x;
-  const normCy = start.y;
-  const normTopY = (cyPx - radiusPx) / vh;
+  const normTopY = (normCy * vh - radiusPx) / vh;
 
   const frame = Math.round(masterTime * masterFPS);
   const pt = {
