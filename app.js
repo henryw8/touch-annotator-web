@@ -44,8 +44,9 @@ let rafId        = null;
 let frameAccurateTimer = null;
 let realTimeFactor = 1;  // real_time_s = video_time_s * realTimeFactor
 
-let annotations          = [];   // { frame, time, surface }
-let selectedSurface      = null;
+let annotations          = [];   // { frame, time, touchType, bodyPart }
+let selectedTouchType    = null; // 'bounce' | 'kick' | 'touch'
+let selectedBodyPart     = null; // 'foot_leg' | 'aerial'
 let editingAnnotationIdx = null; // index in annotations[] being edited post-hoc
 
 // Drawing overlay state
@@ -894,41 +895,46 @@ $('btn-re-sync').addEventListener('click', () => {
 // TOUCH SURFACE SELECTION
 // ═══════════════════════════════════════════════════════════
 
-$('surface-grid').querySelectorAll('.surface-btn').forEach(btn => {
-  btn.addEventListener('click', () => selectSurface(btn.dataset.surface));
+$('touch-type-grid').querySelectorAll('.surface-btn').forEach(btn => {
+  btn.addEventListener('click', () => selectTouchType(btn.dataset.touchType));
+});
+$('body-part-grid').querySelectorAll('.surface-btn').forEach(btn => {
+  btn.addEventListener('click', () => selectBodyPart(btn.dataset.bodyPart));
 });
 
-function selectSurface(name) {
-  $('surface-grid').querySelectorAll('.surface-btn').forEach(b => {
-    b.classList.toggle('selected', b.dataset.surface === name);
+function selectTouchType(name) {
+  $('touch-type-grid').querySelectorAll('.surface-btn').forEach(b => {
+    b.classList.toggle('selected', b.dataset.touchType === name);
   });
-  selectedSurface = name;
+  selectedTouchType = name;
 
-  // Show/hide comment input for "other"
-  const wrap    = $('other-comment-wrap');
-  const input   = $('other-comment');
-  const isOther = name === 'other';
-  wrap.style.display = isOther ? '' : 'none';
-  input.classList.remove('required');
-  if (isOther) {
-    // Pre-fill comment if editing a touch that already has one
-    if (editingAnnotationIdx !== null && annotations[editingAnnotationIdx]) {
-      input.value = annotations[editingAnnotationIdx].comment || '';
-    } else {
-      input.value = '';
-    }
-    input.focus();
+  const needsBodyPart = name === 'touch';
+  $('body-part-section').style.display = needsBodyPart ? '' : 'none';
+  if (!needsBodyPart) {
+    selectedBodyPart = null;
+    $('body-part-grid').querySelectorAll('.surface-btn').forEach(b => b.classList.remove('selected'));
   }
 
-  // If a logged touch is selected for editing, update its surface immediately
+  // If editing an existing touch, update immediately
   if (editingAnnotationIdx !== null && annotations[editingAnnotationIdx]) {
-    // For "other" we wait for the user to fill the comment before committing
-    if (!isOther) {
-      annotations[editingAnnotationIdx].surface = name;
-      annotations[editingAnnotationIdx].comment = '';
-      renderAnnotations();
-      showToast(`Updated: frame ${annotations[editingAnnotationIdx].frame}  ·  ${name}`);
-    }
+    annotations[editingAnnotationIdx].touchType = name;
+    if (!needsBodyPart) annotations[editingAnnotationIdx].bodyPart = null;
+    renderAnnotations();
+    showToast(`Updated: frame ${annotations[editingAnnotationIdx].frame}  ·  ${formatTouchLabel(name, annotations[editingAnnotationIdx].bodyPart)}`);
+  }
+}
+
+function selectBodyPart(name) {
+  $('body-part-grid').querySelectorAll('.surface-btn').forEach(b => {
+    b.classList.toggle('selected', b.dataset.bodyPart === name);
+  });
+  selectedBodyPart = name;
+
+  // If editing an existing touch, update immediately
+  if (editingAnnotationIdx !== null && annotations[editingAnnotationIdx]) {
+    annotations[editingAnnotationIdx].bodyPart = name;
+    renderAnnotations();
+    showToast(`Updated: frame ${annotations[editingAnnotationIdx].frame}  ·  ${name}`);
   }
 }
 
@@ -937,32 +943,6 @@ function selectSurface(name) {
 // ═══════════════════════════════════════════════════════════
 
 $('log-btn').addEventListener('click', logTouch);
-
-// Commit "other + comment" edit when Enter is pressed in the comment box
-$('other-comment').addEventListener('keydown', e => {
-  if (e.key === 'Enter') {
-    e.preventDefault();
-    // If editing an existing touch, commit immediately
-    if (editingAnnotationIdx !== null && annotations[editingAnnotationIdx]) {
-      const comment = $('other-comment').value.trim();
-      if (!comment) { flashCommentRequired(); return; }
-      annotations[editingAnnotationIdx].surface = 'other';
-      annotations[editingAnnotationIdx].comment = comment;
-      renderAnnotations();
-      showToast(`Updated: frame ${annotations[editingAnnotationIdx].frame}  ·  other — ${comment}`);
-    } else {
-      // Otherwise treat Enter as "log touch"
-      logTouch();
-    }
-  }
-});
-
-function flashCommentRequired() {
-  const input = $('other-comment');
-  input.classList.add('required');
-  input.focus();
-  setTimeout(() => input.classList.remove('required'), 1200);
-}
 
 function logTouch() {
   const frame = Math.round(masterTime * masterFPS);
@@ -974,30 +954,24 @@ function logTouch() {
     return;
   }
 
-  // "other" requires a comment
-  if (selectedSurface === 'other') {
-    const comment = $('other-comment').value.trim();
-    if (!comment) { flashCommentRequired(); return; }
-    annotations.push({ frame, time, surface: 'other', comment, height: null, heightUnit: null });
-    annotations.sort((a, b) => a.frame - b.frame);
-    editingAnnotationIdx = annotations.findIndex(a => a.frame === frame);
-    renderAnnotations();
-    showToast(`Logged: frame ${frame}  ·  other — ${comment}`);
-    return;
-  }
-
-  const surface = selectedSurface || null;
-  annotations.push({ frame, time, surface, comment: '', height: null, heightUnit: null });
+  const touchType = selectedTouchType || null;
+  const bodyPart  = touchType === 'touch' ? (selectedBodyPart || null) : null;
+  annotations.push({ frame, time, touchType, bodyPart, height: null, heightUnit: null });
   annotations.sort((a, b) => a.frame - b.frame);
 
-  // Auto-select the new touch for immediate surface editing
+  // Auto-select the new touch for immediate editing
   editingAnnotationIdx = annotations.findIndex(a => a.frame === frame);
 
   renderAnnotations();
-  showToast(surface
-    ? `Logged: frame ${frame}  ·  ${surface}`
-    : `Logged: frame ${frame}  ·  select a surface to assign it`
-  );
+  const label = touchType ? formatTouchLabel(touchType, bodyPart) : 'select a touch type to assign it';
+  showToast(`Logged: frame ${frame}  ·  ${label}`);
+}
+
+function formatTouchLabel(touchType, bodyPart) {
+  if (!touchType) return '';
+  if (touchType === 'bounce') return 'bounce';
+  const bpLabel = bodyPart === 'foot_leg' ? 'foot/leg' : (bodyPart === 'aerial' ? 'aerial' : '');
+  return bpLabel ? `${touchType} · ${bpLabel}` : touchType;
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -1024,23 +998,21 @@ function renderAnnotations() {
   const currentFrame = Math.round(masterTime * masterFPS);
 
   // Update sidebar heading to reflect edit mode
-  const sectionTitle = $('surface-section-title');
+  const sectionTitle = $('touch-type-section-title');
   if (sectionTitle) {
     sectionTitle.textContent = editingAnnotationIdx !== null
       ? `Editing touch @ frame ${annotations[editingAnnotationIdx]?.frame ?? '?'}`
-      : 'Touch Surface';
+      : 'Touch Type';
   }
 
   annotations.forEach((ann, i) => {
     const isEditing = i === editingAnnotationIdx;
 
     let surfaceLabel;
-    if (!ann.surface) {
-      surfaceLabel = '<span class="ann-unassigned">— assign surface →</span>';
-    } else if (ann.surface === 'other' && ann.comment) {
-      surfaceLabel = `other <span class="ann-comment">${ann.comment}</span>`;
+    if (!ann.touchType) {
+      surfaceLabel = '<span class="ann-unassigned">— assign type →</span>';
     } else {
-      surfaceLabel = ann.surface;
+      surfaceLabel = formatTouchLabel(ann.touchType, ann.bodyPart);
     }
     const heightLabel = ann.height != null
       ? ` <span class="ann-comment">${ann.height} ${ann.heightUnit || 'm'}</span>`
@@ -1058,27 +1030,24 @@ function renderAnnotations() {
       <button class="ann-del" title="Delete">✕</button>
     `;
 
-    // Click row → seek to that touch AND select it for surface editing
+    // Click row → seek to that touch AND select it for editing
     row.addEventListener('click', e => {
       if (e.target.classList.contains('ann-del')) return;
       pausePlayback();
       seekToMaster(ann.time);
       editingAnnotationIdx = i;
-      // Reflect surface in buttons
-      $('surface-grid').querySelectorAll('.surface-btn').forEach(b => {
-        b.classList.toggle('selected', b.dataset.surface === ann.surface);
+      // Reflect touch type in buttons
+      $('touch-type-grid').querySelectorAll('.surface-btn').forEach(b => {
+        b.classList.toggle('selected', b.dataset.touchType === ann.touchType);
       });
-      // Show/pre-fill comment box for "other"
-      const wrap  = $('other-comment-wrap');
-      const input = $('other-comment');
-      if (ann.surface === 'other') {
-        wrap.style.display = '';
-        input.value = ann.comment || '';
-        input.focus();
-      } else {
-        wrap.style.display = 'none';
-        input.value = '';
-      }
+      // Reflect body part in buttons and show/hide section
+      const needsBodyPart = ann.touchType === 'touch';
+      $('body-part-section').style.display = needsBodyPart ? '' : 'none';
+      $('body-part-grid').querySelectorAll('.surface-btn').forEach(b => {
+        b.classList.toggle('selected', b.dataset.bodyPart === ann.bodyPart);
+      });
+      selectedTouchType = ann.touchType;
+      selectedBodyPart  = ann.bodyPart;
       renderAnnotations();
     });
 
@@ -1179,10 +1148,10 @@ function parseReviewCsv(text) {
 
   if (!headers) return null;
 
-  const colFrame   = headers.indexOf('frame');
-  const colTime    = headers.indexOf('time_s');
-  const colSurface = headers.indexOf('surface');
-  const colComment    = headers.indexOf('comment');
+  const colFrame     = headers.indexOf('frame');
+  const colTime      = headers.indexOf('time_s');
+  const colTouchType = headers.indexOf('touch_type');
+  const colBodyPart  = headers.indexOf('body_part');
   const colHeight     = headers.indexOf('height');
   const colHeightUnit = headers.indexOf('height_unit');
 
@@ -1203,13 +1172,13 @@ function parseReviewCsv(text) {
     const time    = parseFloat(cols[colTime]);
     if (isNaN(frame) || isNaN(time)) continue;
 
-    const surface = (colSurface >= 0 ? cols[colSurface] : '') || null;
-    const comment = (colComment >= 0 ? cols[colComment] : '') || '';
+    const touchType = (colTouchType >= 0 ? cols[colTouchType] : '') || null;
+    const bodyPart  = (colBodyPart >= 0 ? cols[colBodyPart] : '') || null;
     const rawHeight = colHeight >= 0 ? cols[colHeight] : '';
     const height = rawHeight ? parseFloat(rawHeight) : null;
     const heightUnit = (colHeightUnit >= 0 && cols[colHeightUnit]) ? cols[colHeightUnit] : null;
 
-    annotations.push({ frame, time, surface, comment, height: isNaN(height) ? null : height, heightUnit });
+    annotations.push({ frame, time, touchType, bodyPart, height: isNaN(height) ? null : height, heightUnit });
     perVideoFrames.push(videoCols.map(vc => parseInt(cols[vc.idx])));
   }
 
@@ -1384,13 +1353,9 @@ $('export-csv').addEventListener('click', () => {
     return `frame_${i + 1}_${base}`;
   });
 
-  const headers = ['frame', 'time_s', 'real_time_s', 'surface', 'comment', 'height', 'height_unit', ...videoHeaders];
+  const headers = ['frame', 'time_s', 'real_time_s', 'touch_type', 'body_part', 'height', 'height_unit', ...videoHeaders];
 
   const dataRows = annotations.map(a => {
-    const comment = (a.comment && a.comment.includes(','))
-      ? `"${a.comment}"`
-      : (a.comment || '');
-
     const perVideoFrames = videoItems.map(item => {
       const localTime = a.time + item.syncOffset;
       return Math.round(localTime * item.fps);
@@ -1400,8 +1365,8 @@ $('export-csv').addEventListener('click', () => {
       a.frame,
       a.time.toFixed(6),
       toRealTime(a.time).toFixed(6),
-      a.surface ?? '',
-      comment,
+      a.touchType ?? '',
+      a.bodyPart ?? '',
       a.height ?? '',
       a.heightUnit ?? '',
       ...perVideoFrames,
@@ -1499,12 +1464,12 @@ document.addEventListener('keydown', e => {
       logTouch();
       break;
 
-    // Surface shortcuts: 1–5
-    case '1': selectSurface('foot');  break;
-    case '2': selectSurface('head');  break;
-    case '3': selectSurface('arm');   break;
-    case '4': selectSurface('torso'); break;
-    case '5': selectSurface('other'); break;
+    // Touch type shortcuts: 1–3, Body part: 4–5
+    case '1': selectTouchType('bounce');  break;
+    case '2': selectTouchType('kick');    break;
+    case '3': selectTouchType('touch');   break;
+    case '4': selectBodyPart('foot_leg'); break;
+    case '5': selectBodyPart('aerial');   break;
     case '0': resetAllZoom();         break;
     case '?':
     case 'h':
@@ -2393,20 +2358,19 @@ const HELP_CONTENT = {
     body: `
       <div class="help-section">
         <h3>Goal</h3>
-        <p>Scrub or play through the synced videos and log every ball touch and the contact surface. The frame counter at the bottom-left shows the synced frame across all cameras.</p>
+        <p>Scrub or play through the synced videos and log every ball touch with its type and body part. The frame counter at the bottom-left shows the synced frame across all cameras.</p>
       </div>
       <div class="help-section">
         <h3>Logging a touch</h3>
         <ol class="help-steps">
           <li data-n="1">Pause on the frame of contact (use <strong>← →</strong> for fine control).</li>
-          <li data-n="2">Select a surface (Foot / Head / Arm / Torso / Other) — or skip and assign it later.</li>
+          <li data-n="2">Select a touch type (Bounce / Kick / Touch) and body part (Foot/Leg / Aerial) — or skip and assign later.</li>
           <li data-n="3">Press <strong>T</strong> or click <strong>Log Touch</strong>. The touch appears in the list on the right.</li>
-          <li data-n="4">If you chose <em>Other</em>, a comment box appears — type a description and press <strong>Enter</strong>.</li>
         </ol>
       </div>
       <div class="help-section">
         <h3>Editing a logged touch</h3>
-        <p>Click any row in the touch list to <strong>seek to that frame</strong> and select it for editing. Then click a surface button to assign or change it. The row is highlighted in blue while selected.</p>
+        <p>Click any row in the touch list to <strong>seek to that frame</strong> and select it for editing. Then click a touch type / body part button to assign or change it. The row is highlighted in blue while selected.</p>
       </div>
       <div class="help-section">
         <h3>Keyboard shortcuts</h3>
@@ -2415,7 +2379,8 @@ const HELP_CONTENT = {
           <tr><td><span class="kbd">←</span> <span class="kbd">→</span></td><td>Step one frame back / forward</td></tr>
           <tr><td><span class="kbd">↑</span> <span class="kbd">↓</span></td><td>Jump 1 second back / forward</td></tr>
           <tr><td><span class="kbd">T</span></td><td>Log touch at current frame</td></tr>
-          <tr><td><span class="kbd">1</span>–<span class="kbd">5</span></td><td>Select surface: Foot · Head · Arm · Torso · Other</td></tr>
+          <tr><td><span class="kbd">1</span>–<span class="kbd">3</span></td><td>Touch type: Bounce · Kick · Touch</td></tr>
+          <tr><td><span class="kbd">4</span>–<span class="kbd">5</span></td><td>Body part: Foot/Leg · Aerial</td></tr>
           <tr><td><span class="kbd">H</span> or <span class="kbd">?</span></td><td>Open this help panel</td></tr>
         </table>
       </div>
@@ -2454,7 +2419,7 @@ const HELP_CONTENT = {
       </div>
       <div class="help-section">
         <h3>Exporting</h3>
-        <p>Click <strong>Export CSV</strong> when done. Columns: <code>frame</code>, <code>time_s</code>, <code>surface</code>, <code>comment</code>, <code>height</code>, <code>height_unit</code>, plus one column per video showing that touch's local frame number.</p>
+        <p>Click <strong>Export CSV</strong> when done. Columns: <code>frame</code>, <code>time_s</code>, <code>touch_type</code>, <code>body_part</code>, <code>height</code>, <code>height_unit</code>, plus one column per video showing that touch's local frame number.</p>
       </div>
       <div class="help-tip">
         <strong>Tip:</strong> Use slow playback (0.25×) to spot contacts. Log first, assign surfaces after — it's faster than stopping for each one.

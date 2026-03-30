@@ -328,7 +328,8 @@
       font-size: 11px; text-transform: uppercase;
       letter-spacing: 0.06em; color: var(--text-dim); margin-bottom: 10px;
     }
-    .surface-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+    .touch-type-grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 6px; }
+    .body-part-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
     .surface-btn {
       padding: 8px 6px; border-radius: 6px; text-align: center;
       border: 1px solid var(--border); background: var(--surface2);
@@ -385,16 +386,7 @@
     }
     .ann-unassigned { color: var(--yellow); font-style: italic; }
     .ann-comment { color: var(--text-dim); font-style: italic; font-size: 11px; margin-top: 1px; }
-    #other-comment {
-      width: 100%; padding: 7px 10px;
-      background: var(--surface); border: 1px solid var(--border);
-      border-radius: 6px; color: var(--text); font-size: 13px;
-      outline: none; transition: border-color 0.15s;
-    }
-    #other-comment:focus { border-color: var(--accent); }
-    #other-comment.required { border-color: var(--red); }
-    #surface-section-title { transition: color 0.15s; }
-    .sidebar-section:has(#surface-section-title[data-editing]) h3 { color: var(--accent); }
+    #touch-type-section-title { transition: color 0.15s; }
 
     .sidebar-footer {
       padding: 10px 14px;
@@ -662,17 +654,18 @@
     <div class="annotate-sidebar">
 
       <div class="sidebar-section">
-        <h3 id="surface-section-title">Touch Surface</h3>
-        <div class="surface-grid" id="surface-grid">
-          <button class="surface-btn" data-surface="foot">👟 Foot</button>
-          <button class="surface-btn" data-surface="head">🏃 Head</button>
-          <button class="surface-btn" data-surface="arm">💪 Arm</button>
-          <button class="surface-btn" data-surface="torso">🧥 Torso</button>
-          <button class="surface-btn" data-surface="other" style="grid-column:span 2;">Other</button>
+        <h3 id="touch-type-section-title">Touch Type</h3>
+        <div class="touch-type-grid" id="touch-type-grid">
+          <button class="surface-btn" data-touch-type="bounce">Bounce</button>
+          <button class="surface-btn" data-touch-type="kick">Kick</button>
+          <button class="surface-btn" data-touch-type="touch">Touch</button>
         </div>
-        <div id="other-comment-wrap" style="display:none; margin-top:8px;">
-          <input type="text" id="other-comment" placeholder="Required: describe the touch…"
-                 maxlength="120" autocomplete="off">
+        <div id="body-part-section" style="margin-top:10px;">
+          <h3>Body Part</h3>
+          <div class="body-part-grid" id="body-part-grid">
+            <button class="surface-btn" data-body-part="foot_leg">Foot / Leg</button>
+            <button class="surface-btn" data-body-part="aerial">Aerial</button>
+          </div>
         </div>
         <div id="height-section" style="display:none; margin-top:10px;">
           <label style="font-size:11px;color:var(--text-dim);text-transform:uppercase;letter-spacing:0.05em;display:block;margin-bottom:6px;">Height</label>
