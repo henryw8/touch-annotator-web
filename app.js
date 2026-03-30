@@ -46,7 +46,7 @@ let realTimeFactor = 1;  // real_time_s = video_time_s * realTimeFactor
 
 let annotations          = [];   // { frame, time, touchType, bodyPart }
 let selectedTouchType    = null; // 'bounce' | 'kick' | 'touch'
-let selectedBodyPart     = null; // 'foot_leg' | 'aerial'
+let selectedBodyPart     = null; // 'foot' | 'knee' | 'chest' | 'arm' | 'head'
 let editingAnnotationIdx = null; // index in annotations[] being edited post-hoc
 
 // Drawing overlay state
@@ -970,8 +970,7 @@ function logTouch() {
 function formatTouchLabel(touchType, bodyPart) {
   if (!touchType) return '';
   if (touchType === 'bounce') return 'bounce';
-  const bpLabel = bodyPart === 'foot_leg' ? 'foot/leg' : (bodyPart === 'aerial' ? 'aerial' : '');
-  return bpLabel ? `${touchType} · ${bpLabel}` : touchType;
+  return bodyPart ? `${touchType} · ${bodyPart}` : touchType;
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -1464,12 +1463,15 @@ document.addEventListener('keydown', e => {
       logTouch();
       break;
 
-    // Touch type shortcuts: 1–3, Body part: 4–5
+    // Touch type shortcuts: 1–3, Body part: 4–8
     case '1': selectTouchType('bounce');  break;
     case '2': selectTouchType('kick');    break;
     case '3': selectTouchType('touch');   break;
-    case '4': selectBodyPart('foot_leg'); break;
-    case '5': selectBodyPart('aerial');   break;
+    case '4': selectBodyPart('foot');     break;
+    case '5': selectBodyPart('knee');     break;
+    case '6': selectBodyPart('chest');    break;
+    case '7': selectBodyPart('arm');      break;
+    case '8': selectBodyPart('head');     break;
     case '0': resetAllZoom();         break;
     case '?':
     case 'h':
@@ -2364,7 +2366,7 @@ const HELP_CONTENT = {
         <h3>Logging a touch</h3>
         <ol class="help-steps">
           <li data-n="1">Pause on the frame of contact (use <strong>← →</strong> for fine control).</li>
-          <li data-n="2">Select a touch type (Bounce / Kick / Touch) and body part (Foot/Leg / Aerial) — or skip and assign later.</li>
+          <li data-n="2">Select a touch type (Bounce / Kick / Touch) and body part (Foot / Knee / Chest / Arm / Head) — or skip and assign later.</li>
           <li data-n="3">Press <strong>T</strong> or click <strong>Log Touch</strong>. The touch appears in the list on the right.</li>
         </ol>
       </div>
@@ -2380,7 +2382,7 @@ const HELP_CONTENT = {
           <tr><td><span class="kbd">↑</span> <span class="kbd">↓</span></td><td>Jump 1 second back / forward</td></tr>
           <tr><td><span class="kbd">T</span></td><td>Log touch at current frame</td></tr>
           <tr><td><span class="kbd">1</span>–<span class="kbd">3</span></td><td>Touch type: Bounce · Kick · Touch</td></tr>
-          <tr><td><span class="kbd">4</span>–<span class="kbd">5</span></td><td>Body part: Foot/Leg · Aerial</td></tr>
+          <tr><td><span class="kbd">4</span>–<span class="kbd">8</span></td><td>Body part: Foot · Knee · Chest · Arm · Head</td></tr>
           <tr><td><span class="kbd">H</span> or <span class="kbd">?</span></td><td>Open this help panel</td></tr>
         </table>
       </div>

@@ -329,7 +329,7 @@
       letter-spacing: 0.06em; color: var(--text-dim); margin-bottom: 10px;
     }
     .touch-type-grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 6px; }
-    .body-part-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+    .body-part-grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 6px; }
     .surface-btn {
       padding: 8px 6px; border-radius: 6px; text-align: center;
       border: 1px solid var(--border); background: var(--surface2);
@@ -663,8 +663,11 @@
         <div id="body-part-section" style="margin-top:10px;">
           <h3>Body Part</h3>
           <div class="body-part-grid" id="body-part-grid">
-            <button class="surface-btn" data-body-part="foot_leg">Foot / Leg</button>
-            <button class="surface-btn" data-body-part="aerial">Aerial</button>
+            <button class="surface-btn" data-body-part="foot">Foot</button>
+            <button class="surface-btn" data-body-part="knee">Knee</button>
+            <button class="surface-btn" data-body-part="chest">Chest</button>
+            <button class="surface-btn" data-body-part="arm">Arm</button>
+            <button class="surface-btn" data-body-part="head">Head</button>
           </div>
         </div>
         <div id="height-section" style="display:none; margin-top:10px;">
