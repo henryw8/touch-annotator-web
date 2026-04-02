@@ -71,8 +71,8 @@ let pendingCalibration   = null;      // { cx, cy, rNorm, videoIdx } awaiting po
 
 // Height measurement state
 let measureMode          = false;
-let measureFirstClick    = null;      // {x, y, videoIdx} normalized — first click (ground)
-let measureHoverPt       = null;      // {x, y, videoIdx} normalized — mouse position pre-click-1
+let heightRef         = null;      // { y, videoIdx, height } — persistent reference point at known height
+let measureHoverPt       = null;      // {x, y, videoIdx} — hover position before ground is set
 
 // Zoom/pan state per video
 const zoomStates = new Map(); // videoIdx → { scale, panX, panY, container }
@@ -1769,23 +1769,35 @@ function setupCanvasEvents(canvas, videoIdx) {
     }
 
     // Measurement mode
-    if (measureMode) {
-      if (measureFirstClick && measureFirstClick.videoIdx === videoIdx) {
-        // Post-click-1: rubber-band line from ground point to cursor
-        redrawCanvas(videoIdx);  // draws perpendicular + ground dot
+    if (measureMode && calibrations.has(videoIdx)) {
+      if (heightRef && heightRef.videoIdx === videoIdx) {
+        // Ground set — show vertical rubber-band from ground level to cursor
+        redrawCanvas(videoIdx);
         const mCtx = drawingData.get(videoIdx).ctx;
+        const gy = heightRef.y * canvas.height;
+        const bx = norm.x * canvas.width, by = norm.y * canvas.height;
         mCtx.save();
         mCtx.strokeStyle = '#4aff8a';
         mCtx.lineWidth = 2;
         mCtx.setLineDash([4, 3]);
         mCtx.beginPath();
-        mCtx.moveTo(measureFirstClick.x * canvas.width, measureFirstClick.y * canvas.height);
-        mCtx.lineTo(norm.x * canvas.width, norm.y * canvas.height);
+        mCtx.moveTo(bx, gy);
+        mCtx.lineTo(bx, by);
         mCtx.stroke();
+        // Show live height value near cursor
+        const cal = calibrations.get(videoIdx);
+        const scale = cal.diameter / (2 * cal.rNorm);
+        const h = heightRef.height + (heightRef.y - norm.y) * scale;
+        mCtx.setLineDash([]);
+        mCtx.font = '12px system-ui, sans-serif';
+        mCtx.fillStyle = 'rgba(0,0,0,0.7)';
+        mCtx.fillRect(bx + 8, by - 8, 60, 18);
+        mCtx.fillStyle = '#4aff8a';
+        mCtx.fillText(`${h.toFixed(3)} m`, bx + 12, by + 6);
         mCtx.restore();
         return;
-      } else if (!measureFirstClick && calibrations.has(videoIdx)) {
-        // Pre-click-1: float the perpendicular line with the cursor
+      } else if (!heightRef) {
+        // No ground yet — float the horizontal line with cursor
         measureHoverPt = { x: norm.x, y: norm.y, videoIdx };
         redrawCanvas(videoIdx);
         return;
@@ -1855,7 +1867,7 @@ function setupCanvasEvents(canvas, videoIdx) {
 
     // Handle measurement clicks first
     if (measureMode && !isDragging) {
-      handleMeasureClick(videoIdx, norm);
+      handleMeasureClick(videoIdx, norm, e.shiftKey);
       currentStroke = null;
       dragStartPx = null;
       isDragging = false;
@@ -2014,13 +2026,13 @@ function redrawCanvas(videoIdx) {
   const { ctx, canvas, elements, selectedIdx } = data;
 
   const cal = calibrations.get(videoIdx);
-  const hasMeasureState = measureFirstClick && measureFirstClick.videoIdx === videoIdx;
+  const hasGroundAnchor = heightRef && heightRef.videoIdx === videoIdx;
 
   // Hide canvas when not needed — avoids browser compositing issues with video
   const hasContent = elements.length > 0
     || (lineStartPoint && lineStartVideoIdx === videoIdx)
     || (calibCircleStart && calibCircleVideoIdx === videoIdx)
-    || (cal && showCalibrationLines) || hasMeasureState;
+    || (cal && showCalibrationLines) || hasGroundAnchor;
   const needsCanvas = drawingMode || measureMode || calibrateMode || hasContent;
   canvas.style.display = needsCanvas ? '' : 'none';
   if (!needsCanvas) return;
@@ -2069,20 +2081,16 @@ function redrawCanvas(videoIdx) {
     ctx.restore();
   }
 
-  // Draw perpendicular ground-reference line
-  if (measureMode && cal) {
-    const perpPt = hasMeasureState ? measureFirstClick
-                 : (measureHoverPt && measureHoverPt.videoIdx === videoIdx) ? measureHoverPt
-                 : null;
-    if (perpPt) drawMeasurePerp(ctx, canvas, cal, perpPt, hasMeasureState);
+  // Persistent ground-reference line (always visible once set)
+  if (hasGroundAnchor && cal) {
+    drawMeasurePerp(ctx, canvas, cal, heightRef, true);
   }
 
-  // Draw measurement ground-point dot (after click 1)
-  if (hasMeasureState) {
-    ctx.fillStyle = '#4aff8a';
-    ctx.beginPath();
-    ctx.arc(measureFirstClick.x * canvas.width, measureFirstClick.y * canvas.height, 5, 0, Math.PI * 2);
-    ctx.fill();
+  // Hover preview line (only during measure mode, before ground is set)
+  if (measureMode && !heightRef && cal) {
+    const hoverPt = (measureHoverPt && measureHoverPt.videoIdx === videoIdx)
+                  ? measureHoverPt : null;
+    if (hoverPt) drawMeasurePerp(ctx, canvas, cal, hoverPt, false);
   }
 }
 
@@ -2103,6 +2111,17 @@ function drawMeasurePerp(ctx, canvas, cal, pt, fixed) {
   ctx.lineTo(W, py);
   ctx.stroke();
   ctx.setLineDash([]);
+
+  // Label on persistent reference line
+  if (fixed && pt.height !== undefined) {
+    const label = `ref: ${pt.height} m`;
+    ctx.font = '11px system-ui, sans-serif';
+    const tw = ctx.measureText(label).width;
+    ctx.fillStyle = 'rgba(0,0,0,0.6)';
+    ctx.fillRect(4, py - 16, tw + 8, 15);
+    ctx.fillStyle = 'rgba(74, 255, 138, 0.9)';
+    ctx.fillText(label, 8, py - 4);
+  }
   ctx.restore();
 }
 
@@ -2241,7 +2260,6 @@ function computeHeight(videoIdx, pt1, pt2) {
 
 function enterMeasureMode() {
   measureMode = true;
-  measureFirstClick = null;
   measureHoverPt = null;
 
   // Enable canvases on calibrated videos
@@ -2251,13 +2269,17 @@ function enterMeasureMode() {
     }
   });
 
-  showToast('Click ground level, then ball position on a calibrated video');
+  if (heightRef) {
+    showToast('Click the ball — Shift+click to set a new reference point');
+  } else {
+    showToast('Click a reference point of known height');
+  }
 }
 
 function exitMeasureMode() {
   measureMode = false;
-  measureFirstClick = null;
   measureHoverPt = null;
+  // heightRef persists intentionally
 
   drawingData.forEach(data => {
     data.canvas.classList.remove('measure-active');
@@ -2266,33 +2288,39 @@ function exitMeasureMode() {
   redrawAllCanvases();
 }
 
-function handleMeasureClick(videoIdx, norm) {
+function handleMeasureClick(videoIdx, norm, shiftKey) {
   if (!calibrations.has(videoIdx)) {
-    showToast('This video is not calibrated');
+    showToast('This video is not calibrated — draw a circle around the ball first (C)');
     return;
   }
 
-  if (!measureFirstClick) {
-    measureFirstClick = { x: norm.x, y: norm.y, videoIdx };
+  // Shift+click resets reference, first click sets it
+  if (shiftKey || !heightRef) {
+    const defaultH = heightRef ? heightRef.height : 0;
+    const input = prompt('Height at this reference point (m):', defaultH);
+    if (input === null) return;  // cancelled
+    const refH = parseFloat(input);
+    if (isNaN(refH)) { showToast('Invalid height value'); return; }
+    heightRef = { y: norm.y, videoIdx, height: refH };
     redrawAllCanvases();
-  } else {
-    if (measureFirstClick.videoIdx !== videoIdx) {
-      showToast('Measure both points on the same video');
-      return;
-    }
-
-    const height = computeHeight(videoIdx, measureFirstClick, norm);
-
-    if (editingAnnotationIdx !== null && annotations[editingAnnotationIdx]) {
-      annotations[editingAnnotationIdx].height = parseFloat(height.toFixed(2));
-      annotations[editingAnnotationIdx].heightUnit = 'm';
-      updateHeightSection();
-      renderAnnotations();
-      showToast(`Height: ${height.toFixed(2)} m`);
-    }
-
-    exitMeasureMode();
+    showToast(`Reference set at ${refH} m — now click the ball`);
+    return;  // stay in measure mode for ball click
   }
+
+  // Normal click with reference set — measure ball height
+  const cal = calibrations.get(videoIdx);
+  const scale = cal.diameter / (2 * cal.rNorm);
+  const height = heightRef.height + (heightRef.y - norm.y) * scale;
+
+  if (editingAnnotationIdx !== null && annotations[editingAnnotationIdx]) {
+    annotations[editingAnnotationIdx].height = parseFloat(height.toFixed(4));
+    annotations[editingAnnotationIdx].heightUnit = 'm';
+    updateHeightSection();
+    renderAnnotations();
+    showToast(`Height: ${height.toFixed(3)} m`);
+  }
+
+  exitMeasureMode();
 }
 
 // Draw button event
@@ -2524,12 +2552,14 @@ const HELP_CONTENT = {
         <h3>Height calibration &amp; measurement</h3>
         <ol class="help-steps">
           <li data-n="1">Press <strong>C</strong> or click <strong>⊿ Calibrate</strong> to enter calibration mode.</li>
-          <li data-n="2">Click two points on a video to draw a reference line of known height (e.g. a goalpost = 2.44 m).</li>
-          <li data-n="3">Enter the real-world height and unit in the popover, then click <strong>Set</strong>.</li>
-          <li data-n="4">Log a touch, click it in the list to edit, then click <strong>Measure ▲</strong> in the Height section.</li>
-          <li data-n="5">Click the ground level, then the ball position on the calibrated video. The height is computed automatically.</li>
+          <li data-n="2">Drag a circle around the ball. Adjust by dragging inside (move) or near the edge (resize).</li>
+          <li data-n="3">Press <strong>Enter</strong> to confirm, then set the ball diameter in the popover (default 0.22 m).</li>
+          <li data-n="4">Log a touch, select it in the list, then click <strong>Measure ▲</strong> in the Height section.</li>
+          <li data-n="5">First time: click a reference point of known height (e.g. ground, table edge). Enter the height at that point (0 for ground).</li>
+          <li data-n="6">Click the ball — height is computed relative to the reference and saved to the selected touch.</li>
+          <li data-n="7">For subsequent touches: just select and click the ball (reference persists). <strong>Shift+click</strong> to set a new reference.</li>
         </ol>
-        <p style="margin-top:6px;">You can also type a height value manually. One calibration per video (new calibration replaces old). Use <strong>Hide Lines</strong> / <strong>Clear All</strong> in the calibrate toolbar to manage calibration visuals.</p>
+        <p style="margin-top:6px;">A live height readout appears while hovering. You can also type a height value manually. Use <strong>Hide</strong> / <strong>Clear All</strong> in the calibrate toolbar to manage visuals.</p>
       </div>
       <div class="help-section">
         <h3>Zoom &amp; Pan</h3>
