@@ -233,14 +233,20 @@ async function startFpsDetection() {
     }
   }
 
-  // Detect FPS for each video sequentially
-  for (let i = 0; i < videoItems.length; i++) {
-    const item = videoItems[i];
-    $('fps-status').textContent = `Detecting FPS — video ${i + 1} / ${videoItems.length}…`;
+  // Detect FPS for all videos in parallel
+  const total = videoItems.length;
+  let done = 0;
+  const updateStatus = () => {
+    $('fps-status').textContent = `Detecting FPS — ${done} / ${total} done…`;
+  };
+  updateStatus();
+  await Promise.all(videoItems.map(async (item) => {
     item.fps = await detectFPS(item.el);
-    $('fps-status').textContent = `Video ${i + 1}: ${item.fps} fps ✓`;
-    await sleep(350);
-  }
+    done++;
+    updateStatus();
+  }));
+  $('fps-status').textContent = videoItems.map((v, i) => `Video ${i + 1}: ${v.fps} fps`).join('  ·  ') + ' ✓';
+  await sleep(400);
 
   // First video drives the master frame counter
   masterFPS = videoItems[0].fps;
@@ -301,31 +307,15 @@ function sampleFPS(video, playbackRate, sampleFrames, timeoutMs) {
   });
 }
 
-// Display refresh rates — when Pass 1 returns one of these, it could be
-// display-capped (e.g. 60 from a 1000fps video). Otherwise we trust Pass 1.
-const DISPLAY_LIKE_FPS = new Set([48, 50, 59, 60, 72, 75, 90, 120, 144, 240]);
-
 async function detectFPS(video) {
   if (!('requestVideoFrameCallback' in HTMLVideoElement.prototype)) {
     return 25;
   }
-
-  const pass1 = await sampleFPS(video, 1, 60, 10000);
-  if (pass1 > 240) {
-    return Math.max(10, Math.min(10000, pass1));
+  const fps = await sampleFPS(video, 1, 30, 8000);
+  if (fps > 0) {
+    return Math.max(10, Math.min(10000, fps));
   }
-  if (!DISPLAY_LIKE_FPS.has(pass1)) {
-    // 24, 30, etc. — not a display rate, so Pass 1 is trustworthy
-    return Math.max(10, Math.min(10000, pass1));
-  }
-
-  // Pass 2: Pass 1 could be display-capped. Slow playback to get true rate.
-  const pass2 = await sampleFPS(video, 0.05, 15, 15000);
-  if (pass2 > 0) {
-    return Math.max(10, Math.min(10000, pass2));
-  }
-
-  return pass1 > 0 ? Math.max(10, Math.min(10000, pass1)) : 25;
+  return 25;
 }
 
 // ═══════════════════════════════════════════════════════════
