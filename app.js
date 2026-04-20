@@ -41,7 +41,6 @@ let masterMin    = 0;    // earliest valid masterTime
 let masterMax    = 60;   // latest valid masterTime
 let isPlaying    = false;
 let rafId        = null;
-let frameAccurateTimer = null;
 let realTimeFactor = 1;  // real_time_s = video_time_s * realTimeFactor
 
 let annotations          = [];   // { frame, time, touchType, bodyPart }
@@ -51,28 +50,12 @@ let editingAnnotationIdx = null; // index in annotations[] being edited post-hoc
 
 // Drawing overlay state
 let drawingMode      = false;
-let drawToolMode     = 'free'; // 'free' | 'line' | 'erase' | 'calibrate'
+let drawToolMode     = 'free'; // 'free' | 'line' | 'erase'
 const drawingData    = new Map(); // videoIdx → {elements[], selectedIdx, canvas, ctx}
 let lineStartPoint   = null;     // {x,y} in 0-1 coords for in-progress line
 let lineStartVideoIdx = null;    // which video the in-progress line is on
 let drawColor        = '#4a9eff'; // current drawing color
 let lineAngle        = null;      // degrees (null = free angle)
-
-// Calibration state
-let calibrateMode        = false;     // true when calibration mode is active (separate from draw)
-let showCalibrationLines = true;      // toggle visibility of calibration visuals
-const calibrations       = new Map(); // videoIdx → { cx, cy, rNorm, diameter }
-let calibCircleStart     = null;      // {x,y} normalized — center of circle being drawn
-let calibCircleVideoIdx  = null;
-let calibPending         = null;      // { cx, cy, rNorm, videoIdx } — adjustable circle before confirm
-let calibDragMode        = null;      // 'new' | 'move' | 'resize'
-let calibDragOffset      = null;      // { dx, dy } offset for move drag
-let pendingCalibration   = null;      // { cx, cy, rNorm, videoIdx } awaiting popover confirm
-
-// Height measurement state
-let measureMode          = false;
-let heightRef         = null;      // { y, videoIdx, height } — persistent reference point at known height
-let measureHoverPt       = null;      // {x, y, videoIdx} — hover position before ground is set
 
 // Zoom/pan state per video
 const zoomStates = new Map(); // videoIdx → { scale, panX, panY, container }
@@ -510,7 +493,6 @@ const frameDisplay  = $('frame-display');
 const timeDisplay   = $('time-display');
 const masterScrubber = $('master-scrubber');
 const realTimeFactorInput = $('real-time-factor');
-const frameAccurateModeInput = $('frame-accurate-mode');
 const btnPlay  = $('btn-play');
 const btnPrev  = $('btn-prev');
 const btnNext  = $('btn-next');
@@ -614,82 +596,6 @@ function buildAnnotateScreen() {
   document.getElementById('draw-clear-all').addEventListener('click', clearAllDrawings);
   document.getElementById('draw-close').addEventListener('click', () => toggleDrawingMode(false));
 
-  // Calibration popover (placed after toolbar in DOM)
-  let calPopover = document.getElementById('calibration-popover');
-  if (calPopover) calPopover.remove();
-  calPopover = document.createElement('div');
-  calPopover.id = 'calibration-popover';
-  calPopover.className = 'calibration-popover';
-  calPopover.innerHTML = `
-    <span style="font-size:12px;color:var(--text-dim);">Ball diameter (m):</span>
-    <input type="number" id="cal-height-input" value="0.22" step="0.001" min="0.01"
-      style="width:70px;">
-    <button class="btn btn-sm btn-primary" id="cal-set-btn">Set</button>
-    <button class="btn btn-sm" id="cal-cancel-btn">Cancel</button>
-  `;
-  annotateMain.insertBefore(calPopover, videoGrid);
-
-  document.getElementById('cal-set-btn').addEventListener('click', () => {
-    if (!pendingCalibration) return;
-    const val = parseFloat(document.getElementById('cal-height-input').value);
-    if (isNaN(val) || val <= 0) {
-      showToast('Enter a valid diameter');
-      return;
-    }
-    calibrations.set(pendingCalibration.videoIdx, {
-      cx: pendingCalibration.cx,
-      cy: pendingCalibration.cy,
-      rNorm: pendingCalibration.rNorm,
-      diameter: val,
-    });
-    pendingCalibration = null;
-    calPopover.classList.remove('visible');
-    redrawAllCanvases();
-    showToast(`Calibration set: Ø ${val} m`);
-  });
-
-  document.getElementById('cal-cancel-btn').addEventListener('click', () => {
-    pendingCalibration = null;
-    calPopover.classList.remove('visible');
-    redrawAllCanvases();
-  });
-
-  document.getElementById('cal-height-input').addEventListener('keydown', e => {
-    if (e.key === 'Enter') {
-      e.preventDefault();
-      document.getElementById('cal-set-btn').click();
-    }
-  });
-
-  // Build calibrate toolbar (separate from draw toolbar)
-  let calToolbar = document.getElementById('calibrate-toolbar');
-  if (calToolbar) calToolbar.remove();
-  calToolbar = document.createElement('div');
-  calToolbar.id = 'calibrate-toolbar';
-  calToolbar.className = 'draw-toolbar';  // reuse draw-toolbar styling
-  calToolbar.innerHTML = `
-    <span style="font-size:12px;color:var(--text-dim);">Drag a circle around the ball</span>
-    <div class="draw-sep"></div>
-    <button class="btn btn-sm" id="cal-toggle-lines">${showCalibrationLines ? 'Hide' : 'Show'}</button>
-    <button class="btn btn-sm" id="cal-clear-all">Clear All</button>
-    <button class="btn btn-sm" id="cal-close">✕</button>
-  `;
-  annotateMain.insertBefore(calToolbar, videoGrid);
-
-  document.getElementById('cal-toggle-lines').addEventListener('click', () => {
-    showCalibrationLines = !showCalibrationLines;
-    document.getElementById('cal-toggle-lines').textContent = showCalibrationLines ? 'Hide' : 'Show';
-    redrawAllCanvases();
-  });
-  document.getElementById('cal-clear-all').addEventListener('click', () => {
-    if (calibrations.size === 0 && !calibPending) { showToast('Nothing to clear'); return; }
-    calibrations.clear();
-    calibPending = null;
-    redrawAllCanvases();
-    showToast('All calibrations cleared');
-  });
-  document.getElementById('cal-close').addEventListener('click', () => toggleCalibrateMode(false));
-
   // Init canvases + ResizeObserver
   initDrawingCanvases();
 
@@ -753,26 +659,6 @@ function startPlayback() {
   btnPlay.title = 'Pause (Space)';
 
   const rate = parseFloat($('playback-rate').value);
-  const frameAccurateMode = !!(frameAccurateModeInput && frameAccurateModeInput.checked);
-
-  if (frameAccurateMode) {
-    // In frame-accurate mode, advance exactly one frame per tick. If the browser
-    // cannot sustain the requested rate, playback slows down instead of skipping.
-    videoItems.forEach(item => item.el.pause());
-    const frameStep = 1 / masterFPS;
-    const intervalMs = Math.max(4, 1000 / (masterFPS * rate));
-    frameAccurateTimer = setInterval(() => {
-      if (!isPlaying) return;
-      const nextTime = masterTime + frameStep;
-      if (nextTime >= masterMax) {
-        pausePlayback();
-        seekToMaster(masterMax);
-        return;
-      }
-      seekToMaster(nextTime);
-    }, intervalMs);
-    return;
-  }
 
   videoItems.forEach(item => {
     const t = Math.max(0, Math.min(item.el.duration, masterTime + item.syncOffset));
@@ -791,10 +677,6 @@ function pausePlayback() {
   btnPlay.title = 'Play (Space)';
   cancelAnimationFrame(rafId);
   rafId = null;
-  if (frameAccurateTimer !== null) {
-    clearInterval(frameAccurateTimer);
-    frameAccurateTimer = null;
-  }
   videoItems.forEach(item => item.el.pause());
 }
 
@@ -851,27 +733,10 @@ masterScrubber.addEventListener('input', () => {
 
 $('playback-rate').addEventListener('change', function () {
   if (isPlaying) {
-    const frameAccurateMode = !!(frameAccurateModeInput && frameAccurateModeInput.checked);
-    if (frameAccurateMode) {
-      // Restart interval to apply new frame cadence.
-      pausePlayback();
-      startPlayback();
-    } else {
-      const rate = parseFloat(this.value);
-      videoItems.forEach(item => { item.el.playbackRate = rate; });
-    }
+    const rate = parseFloat(this.value);
+    videoItems.forEach(item => { item.el.playbackRate = rate; });
   }
 });
-
-if (frameAccurateModeInput) {
-  frameAccurateModeInput.addEventListener('change', () => {
-    if (isPlaying) {
-      // Switch playback engine immediately when toggled.
-      pausePlayback();
-      startPlayback();
-    }
-  });
-}
 
 $('btn-re-sync').addEventListener('click', () => {
   pausePlayback();
@@ -945,7 +810,7 @@ function logTouch() {
 
   const touchType = selectedTouchType || null;
   const bodyPart  = touchType === 'touch' ? (selectedBodyPart || null) : null;
-  annotations.push({ frame, time, touchType, bodyPart, height: null, heightUnit: null });
+  annotations.push({ frame, time, touchType, bodyPart });
   annotations.sort((a, b) => a.frame - b.frame);
 
   // Auto-select the new touch for immediate editing
@@ -1002,9 +867,6 @@ function renderAnnotations() {
     } else {
       surfaceLabel = formatTouchLabel(ann.touchType, ann.bodyPart);
     }
-    const heightLabel = ann.height != null
-      ? ` <span class="ann-comment">${ann.height} ${ann.heightUnit || 'm'}</span>`
-      : '';
 
     const row = document.createElement('div');
     row.className = 'annotation-row'
@@ -1014,7 +876,7 @@ function renderAnnotations() {
     row.innerHTML = `
       <span class="ann-frame">${ann.frame}</span>
       <span class="ann-time">${ann.time.toFixed(3)}s (real ${toRealTime(ann.time).toFixed(3)}s)</span>
-      <span class="ann-surface">${surfaceLabel}${heightLabel}</span>
+      <span class="ann-surface">${surfaceLabel}</span>
       <button class="ann-del" title="Delete">✕</button>
     `;
 
@@ -1049,28 +911,6 @@ function renderAnnotations() {
 
     list.appendChild(row);
   });
-
-  updateHeightSection();
-}
-
-function updateHeightSection() {
-  const section = $('height-section');
-  if (!section) return;
-
-  if (editingAnnotationIdx === null) {
-    section.style.display = 'none';
-    return;
-  }
-
-  section.style.display = '';
-  const ann = annotations[editingAnnotationIdx];
-  if (!ann) { section.style.display = 'none'; return; }
-
-  const input = $('height-input');
-  const unitLabel = $('height-unit-label');
-
-  input.value = ann.height != null ? ann.height : '';
-  unitLabel.textContent = ann.heightUnit || 'm';
 }
 
 function highlightCurrentRow() {
@@ -1140,8 +980,6 @@ function parseReviewCsv(text) {
   const colTime      = headers.indexOf('time_s');
   const colTouchType = headers.indexOf('touch_type');
   const colBodyPart  = headers.indexOf('body_part');
-  const colHeight     = headers.indexOf('height');
-  const colHeightUnit = headers.indexOf('height_unit');
 
   if (colFrame < 0 || colTime < 0) return null;
 
@@ -1162,11 +1000,8 @@ function parseReviewCsv(text) {
 
     const touchType = (colTouchType >= 0 ? cols[colTouchType] : '') || null;
     const bodyPart  = (colBodyPart >= 0 ? cols[colBodyPart] : '') || null;
-    const rawHeight = colHeight >= 0 ? cols[colHeight] : '';
-    const height = rawHeight ? parseFloat(rawHeight) : null;
-    const heightUnit = (colHeightUnit >= 0 && cols[colHeightUnit]) ? cols[colHeightUnit] : null;
 
-    annotations.push({ frame, time, touchType, bodyPart, height: isNaN(height) ? null : height, heightUnit });
+    annotations.push({ frame, time, touchType, bodyPart });
     perVideoFrames.push(videoCols.map(vc => parseInt(cols[vc.idx])));
   }
 
@@ -1341,7 +1176,7 @@ $('export-csv').addEventListener('click', () => {
     return `frame_${i + 1}_${base}`;
   });
 
-  const headers = ['frame', 'time_s', 'real_time_s', 'touch_type', 'body_part', 'height', 'height_unit', ...videoHeaders];
+  const headers = ['frame', 'time_s', 'real_time_s', 'touch_type', 'body_part', ...videoHeaders];
 
   const dataRows = annotations.map(a => {
     const perVideoFrames = videoItems.map(item => {
@@ -1355,8 +1190,6 @@ $('export-csv').addEventListener('click', () => {
       toRealTime(a.time).toFixed(6),
       a.touchType ?? '',
       a.bodyPart ?? '',
-      a.height ?? '',
-      a.heightUnit ?? '',
       ...perVideoFrames,
     ];
   });
@@ -1485,43 +1318,12 @@ document.addEventListener('keydown', e => {
     case 'E':
       if (drawingMode) setDrawTool('erase');
       break;
-    case 'c':
-    case 'C':
-      toggleCalibrateMode();
-      break;
     case 'Delete':
     case 'Backspace':
       if (drawingMode) deleteSelectedDrawing();
       break;
-    case 'Enter':
-      if (calibrateMode && calibPending &&
-          !document.getElementById('calibration-popover')?.classList.contains('visible')) {
-        e.preventDefault();
-        pendingCalibration = { cx: calibPending.cx, cy: calibPending.cy,
-                               rNorm: calibPending.rNorm, videoIdx: calibPending.videoIdx };
-        calibPending = null;
-        showCalibrationPopover();
-      }
-      break;
     case 'Escape':
-      if (measureMode) {
-        e.preventDefault();
-        exitMeasureMode();
-      } else if (pendingCalibration) {
-        e.preventDefault();
-        pendingCalibration = null;
-        const calPop = document.getElementById('calibration-popover');
-        if (calPop) calPop.classList.remove('visible');
-        redrawAllCanvases();
-      } else if (calibrateMode) {
-        e.preventDefault();
-        if (calibPending) {
-          calibPending = null;
-          redrawAllCanvases();
-        } else {
-          toggleCalibrateMode(false);
-        }
-      } else if (drawingMode) {
+      if (drawingMode) {
         e.preventDefault();
         if (lineStartPoint) {
           lineStartPoint = null;
@@ -1572,8 +1374,6 @@ function toggleDrawingMode(forceState) {
   const btn = document.getElementById('btn-draw');
   if (drawingMode) {
     btn.classList.add('btn-primary');
-    // Exit calibrate mode if active (mutually exclusive)
-    if (calibrateMode) toggleCalibrateMode(false);
   } else {
     btn.classList.remove('btn-primary');
     lineStartPoint = null;
@@ -1593,48 +1393,7 @@ function toggleDrawingMode(forceState) {
   // Update zoom cursors
   zoomStates.forEach(state => {
     const cell = state.container.parentElement;
-    cell.style.cursor = (!drawingMode && !calibrateMode && state.scale > 1) ? 'grab' : '';
-  });
-
-  redrawAllCanvases();
-}
-
-function toggleCalibrateMode(forceState) {
-  calibrateMode = forceState !== undefined ? forceState : !calibrateMode;
-
-  const btn = document.getElementById('btn-calibrate');
-  if (calibrateMode) {
-    btn.classList.add('btn-primary');
-    // Exit draw mode if active (mutually exclusive)
-    if (drawingMode) toggleDrawingMode(false);
-  } else {
-    btn.classList.remove('btn-primary');
-    calibCircleStart = null;
-    calibCircleVideoIdx = null;
-    calibPending = null;
-    calibDragMode = null;
-    pendingCalibration = null;
-    const calPopover = document.getElementById('calibration-popover');
-    if (calPopover) calPopover.classList.remove('visible');
-  }
-
-  // Toggle calibrate toolbar visibility
-  const calToolbar = document.getElementById('calibrate-toolbar');
-  if (calToolbar) calToolbar.classList.toggle('visible', calibrateMode);
-
-  // Toggle canvas pointer events
-  drawingData.forEach(data => {
-    if (calibrateMode) {
-      data.canvas.classList.add('active');
-    } else if (!drawingMode) {
-      data.canvas.classList.remove('active');
-    }
-  });
-
-  // Update zoom cursors
-  zoomStates.forEach(state => {
-    const cell = state.container.parentElement;
-    cell.style.cursor = (!drawingMode && !calibrateMode && state.scale > 1) ? 'grab' : '';
+    cell.style.cursor = (!drawingMode && state.scale > 1) ? 'grab' : '';
   });
 
   redrawAllCanvases();
@@ -1704,7 +1463,7 @@ function setupCanvasEvents(canvas, videoIdx) {
   let currentStroke = null; // freehand points being drawn
 
   canvas.addEventListener('mousedown', e => {
-    if (!drawingMode && !measureMode && !calibrateMode) return;
+    if (!drawingMode) return;
     const rect = canvas.getBoundingClientRect();
     const px = { x: e.clientX - rect.left, y: e.clientY - rect.top };
     const norm = { x: px.x / rect.width, y: px.y / rect.height };
@@ -1713,38 +1472,13 @@ function setupCanvasEvents(canvas, videoIdx) {
     isDragging = false;
     currentStroke = null;
 
-    // Calibrate mode: determine interaction with pending circle or start new
-    if (calibrateMode) {
-      if (calibPending && calibPending.videoIdx === videoIdx) {
-        const cW = canvas.width, cH = canvas.height;
-        const dx = (norm.x - calibPending.cx) * cW;
-        const dy = (norm.y - calibPending.cy) * cH;
-        const dist = Math.sqrt(dx * dx + dy * dy);
-        const rPx = calibPending.rNorm * cH;
-        if (dist < rPx * 0.7) {
-          calibDragMode = 'move';
-          calibDragOffset = { dx: norm.x - calibPending.cx, dy: norm.y - calibPending.cy };
-        } else if (dist < rPx * 1.5) {
-          calibDragMode = 'resize';
-        } else {
-          calibDragMode = 'new';
-          calibCircleStart = norm;
-          calibCircleVideoIdx = videoIdx;
-        }
-      } else {
-        calibDragMode = 'new';
-        calibCircleStart = norm;
-        calibCircleVideoIdx = videoIdx;
-      }
-    }
-
-    if (drawingMode && drawToolMode === 'free') {
+    if (drawToolMode === 'free') {
       currentStroke = [norm];
     }
   });
 
   canvas.addEventListener('mousemove', e => {
-    if (!drawingMode && !measureMode && !calibrateMode) return;
+    if (!drawingMode) return;
     const rect = canvas.getBoundingClientRect();
     const px = { x: e.clientX - rect.left, y: e.clientY - rect.top };
     const norm = { x: px.x / rect.width, y: px.y / rect.height };
@@ -1757,83 +1491,6 @@ function setupCanvasEvents(canvas, videoIdx) {
         isDragging = true;
       }
     }
-
-    // Measurement mode
-    if (measureMode && calibrations.has(videoIdx)) {
-      if (heightRef && heightRef.videoIdx === videoIdx) {
-        // Ground set — show vertical rubber-band from ground level to cursor
-        redrawCanvas(videoIdx);
-        const mCtx = drawingData.get(videoIdx).ctx;
-        const gy = heightRef.y * canvas.height;
-        const bx = norm.x * canvas.width, by = norm.y * canvas.height;
-        mCtx.save();
-        mCtx.strokeStyle = '#4aff8a';
-        mCtx.lineWidth = 2;
-        mCtx.setLineDash([4, 3]);
-        mCtx.beginPath();
-        mCtx.moveTo(bx, gy);
-        mCtx.lineTo(bx, by);
-        mCtx.stroke();
-        // Show live height value near cursor
-        const cal = calibrations.get(videoIdx);
-        const scale = cal.diameter / (2 * cal.rNorm);
-        const h = heightRef.height + (heightRef.y - norm.y) * scale;
-        mCtx.setLineDash([]);
-        mCtx.font = '12px system-ui, sans-serif';
-        mCtx.fillStyle = 'rgba(0,0,0,0.7)';
-        mCtx.fillRect(bx + 8, by - 8, 60, 18);
-        mCtx.fillStyle = '#4aff8a';
-        mCtx.fillText(`${h.toFixed(3)} m`, bx + 12, by + 6);
-        mCtx.restore();
-        return;
-      } else if (!heightRef) {
-        // No ground yet — float the horizontal line with cursor
-        measureHoverPt = { x: norm.x, y: norm.y, videoIdx };
-        redrawCanvas(videoIdx);
-        return;
-      }
-    }
-
-    // Calibrate mode: move / resize / draw new circle
-    if (calibrateMode && isDragging && calibDragMode) {
-      const cCtx = drawingData.get(videoIdx).ctx;
-      const W = canvas.width, H = canvas.height;
-
-      if (calibDragMode === 'move' && calibPending) {
-        calibPending.cx = norm.x - calibDragOffset.dx;
-        calibPending.cy = norm.y - calibDragOffset.dy;
-        redrawCanvas(videoIdx);
-        return;
-      }
-      if (calibDragMode === 'resize' && calibPending) {
-        const dx = norm.x * W - calibPending.cx * W;
-        const dy = norm.y * H - calibPending.cy * H;
-        calibPending.rNorm = Math.max(5 / H, Math.sqrt(dx * dx + dy * dy) / H);
-        redrawCanvas(videoIdx);
-        return;
-      }
-      if (calibDragMode === 'new' && calibCircleStart && calibCircleVideoIdx === videoIdx) {
-        redrawCanvas(videoIdx);
-        const cx = calibCircleStart.x * W, cy = calibCircleStart.y * H;
-        const r = Math.sqrt((norm.x * W - cx) ** 2 + (norm.y * H - cy) ** 2);
-        if (r > 3) {
-          cCtx.save();
-          cCtx.strokeStyle = '#4aff8a';
-          cCtx.lineWidth = 2;
-          cCtx.beginPath();
-          cCtx.arc(cx, cy, r, 0, Math.PI * 2);
-          cCtx.stroke();
-          cCtx.fillStyle = '#4aff8a';
-          cCtx.beginPath();
-          cCtx.arc(cx, cy, 3, 0, Math.PI * 2);
-          cCtx.fill();
-          cCtx.restore();
-        }
-        return;
-      }
-    }
-
-    if (!drawingMode) return;
 
     if (drawToolMode === 'free' && isDragging && currentStroke) {
       currentStroke.push(norm);
@@ -1850,56 +1507,10 @@ function setupCanvasEvents(canvas, videoIdx) {
   });
 
   canvas.addEventListener('mouseup', e => {
-    if (!drawingMode && !measureMode && !calibrateMode) return;
+    if (!drawingMode) return;
     const rect = canvas.getBoundingClientRect();
     const px = { x: e.clientX - rect.left, y: e.clientY - rect.top };
     const norm = { x: px.x / rect.width, y: px.y / rect.height };
-
-    // Handle measurement clicks first
-    if (measureMode && !isDragging) {
-      handleMeasureClick(videoIdx, norm, e.shiftKey);
-      currentStroke = null;
-      dragStartPx = null;
-      isDragging = false;
-      return;
-    }
-
-    // Handle calibration: store adjustable circle (popover on Enter)
-    if (calibrateMode) {
-      if (calibDragMode === 'new' && isDragging && calibCircleStart && calibCircleVideoIdx === videoIdx) {
-        const W = canvas.width, H = canvas.height;
-        const rPx = Math.sqrt(
-          (norm.x * W - calibCircleStart.x * W) ** 2 +
-          (norm.y * H - calibCircleStart.y * H) ** 2
-        );
-        if (rPx > 5) {
-          calibPending = {
-            cx: calibCircleStart.x,
-            cy: calibCircleStart.y,
-            rNorm: rPx / H,
-            videoIdx,
-          };
-          showToast('Drag inside to move, edge to resize — Enter to confirm');
-        }
-      }
-      // move / resize already updated during mousemove
-      calibDragMode = null;
-      calibDragOffset = null;
-      calibCircleStart = null;
-      calibCircleVideoIdx = null;
-      currentStroke = null;
-      dragStartPx = null;
-      isDragging = false;
-      redrawAllCanvases();
-      return;
-    }
-
-    if (!drawingMode) {
-      currentStroke = null;
-      dragStartPx = null;
-      isDragging = false;
-      return;
-    }
 
     const data = drawingData.get(videoIdx);
 
@@ -2015,25 +1626,14 @@ function redrawCanvas(videoIdx) {
   if (!data) return;
   const { ctx, canvas, elements, selectedIdx } = data;
 
-  const cal = calibrations.get(videoIdx);
-  const hasGroundAnchor = heightRef && heightRef.videoIdx === videoIdx;
-
   // Hide canvas when not needed — avoids browser compositing issues with video
   const hasContent = elements.length > 0
-    || (lineStartPoint && lineStartVideoIdx === videoIdx)
-    || (calibCircleStart && calibCircleVideoIdx === videoIdx)
-    || (cal && showCalibrationLines) || hasGroundAnchor;
-  const needsCanvas = drawingMode || measureMode || calibrateMode || hasContent;
+    || (lineStartPoint && lineStartVideoIdx === videoIdx);
+  const needsCanvas = drawingMode || hasContent;
   canvas.style.display = needsCanvas ? '' : 'none';
   if (!needsCanvas) return;
 
   ctx.clearRect(0, 0, canvas.width, canvas.height);
-
-  // Draw calibration circle (underneath drawings)
-  if (cal && showCalibrationLines) {
-    const opacity = (drawingMode || calibrateMode) ? 1.0 : 0.4;
-    drawCalibrationCircle(ctx, canvas, cal, opacity);
-  }
 
   elements.forEach((el, i) => {
     const isSelected = i === selectedIdx;
@@ -2052,67 +1652,6 @@ function redrawCanvas(videoIdx) {
     ctx.arc(lineStartPoint.x * canvas.width, lineStartPoint.y * canvas.height, 4, 0, Math.PI * 2);
     ctx.fill();
   }
-
-  // Draw adjustable pending calibration circle (green, before Enter confirm)
-  if (calibPending && calibPending.videoIdx === videoIdx) {
-    const cpx = calibPending.cx * canvas.width;
-    const cpy = calibPending.cy * canvas.height;
-    const rPx = calibPending.rNorm * canvas.height;
-    ctx.save();
-    ctx.strokeStyle = '#4aff8a';
-    ctx.lineWidth = 2;
-    ctx.beginPath();
-    ctx.arc(cpx, cpy, rPx, 0, Math.PI * 2);
-    ctx.stroke();
-    ctx.fillStyle = '#4aff8a';
-    ctx.beginPath();
-    ctx.arc(cpx, cpy, 3, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.restore();
-  }
-
-  // Persistent ground-reference line (always visible once set)
-  if (hasGroundAnchor && cal) {
-    drawMeasurePerp(ctx, canvas, cal, heightRef, true);
-  }
-
-  // Hover preview line (only during measure mode, before ground is set)
-  if (measureMode && !heightRef && cal) {
-    const hoverPt = (measureHoverPt && measureHoverPt.videoIdx === videoIdx)
-                  ? measureHoverPt : null;
-    if (hoverPt) drawMeasurePerp(ctx, canvas, cal, hoverPt, false);
-  }
-}
-
-/**
- * Draw a horizontal dashed ground-reference line through `pt`.
- * Height direction is vertical, so the perpendicular is horizontal.
- */
-function drawMeasurePerp(ctx, canvas, cal, pt, fixed) {
-  const W = canvas.width, H = canvas.height;
-  const py = pt.y * H;
-
-  ctx.save();
-  ctx.strokeStyle = fixed ? 'rgba(74, 255, 138, 0.7)' : 'rgba(74, 255, 138, 0.35)';
-  ctx.lineWidth = 1;
-  ctx.setLineDash([6, 4]);
-  ctx.beginPath();
-  ctx.moveTo(0, py);
-  ctx.lineTo(W, py);
-  ctx.stroke();
-  ctx.setLineDash([]);
-
-  // Label on persistent reference line
-  if (fixed && pt.height !== undefined) {
-    const label = `ref: ${pt.height} m`;
-    ctx.font = '11px system-ui, sans-serif';
-    const tw = ctx.measureText(label).width;
-    ctx.fillStyle = 'rgba(0,0,0,0.6)';
-    ctx.fillRect(4, py - 16, tw + 8, 15);
-    ctx.fillStyle = 'rgba(74, 255, 138, 0.9)';
-    ctx.fillText(label, 8, py - 4);
-  }
-  ctx.restore();
 }
 
 function drawFreehandElement(ctx, canvas, points, selected, color) {
@@ -2191,159 +1730,8 @@ function snapLineEnd(start, end) {
   return { x: start.x + Math.cos(rad) * len, y: start.y + Math.sin(rad) * len };
 }
 
-// ── Calibration & height measurement ──
-
-function drawCalibrationCircle(ctx, canvas, cal, opacity) {
-  const W = canvas.width, H = canvas.height;
-  const cx = cal.cx * W, cy = cal.cy * H;
-  const r  = cal.rNorm * H;
-
-  ctx.save();
-  ctx.globalAlpha = opacity;
-
-  // Circle outline
-  ctx.strokeStyle = '#ffffff';
-  ctx.lineWidth = 2;
-  ctx.setLineDash([6, 4]);
-  ctx.beginPath();
-  ctx.arc(cx, cy, r, 0, Math.PI * 2);
-  ctx.stroke();
-
-  // Center dot
-  ctx.setLineDash([]);
-  ctx.fillStyle = '#ffffff';
-  ctx.beginPath();
-  ctx.arc(cx, cy, 3, 0, Math.PI * 2);
-  ctx.fill();
-
-  // Label above circle
-  const label = `Ø ${cal.diameter} m`;
-  ctx.font = '12px system-ui, sans-serif';
-  ctx.textAlign = 'center';
-  ctx.textBaseline = 'bottom';
-  const metrics = ctx.measureText(label);
-  const pad = 4;
-  const ly = cy - r - 6;
-  ctx.fillStyle = 'rgba(0,0,0,0.7)';
-  ctx.fillRect(cx - metrics.width / 2 - pad, ly - 14, metrics.width + pad * 2, 16 + pad);
-  ctx.fillStyle = '#ffffff';
-  ctx.fillText(label, cx, ly + pad);
-  ctx.restore();
-}
-
-function showCalibrationPopover() {
-  const popover = document.getElementById('calibration-popover');
-  if (!popover) return;
-  const existing = pendingCalibration ? calibrations.get(pendingCalibration.videoIdx) : null;
-  document.getElementById('cal-height-input').value = existing ? existing.diameter : '0.22';
-  popover.classList.add('visible');
-  document.getElementById('cal-height-input').focus();
-}
-
-function computeHeight(videoIdx, pt1, pt2) {
-  const cal = calibrations.get(videoIdx);
-  if (!cal || !cal.rNorm || cal.rNorm <= 0) return null;
-  // Scale: diameter / (2 × rNorm) gives metres per unit of normY.
-  // Height = vertical displacement × scale.
-  return Math.abs(pt1.y - pt2.y) * cal.diameter / (2 * cal.rNorm);
-}
-
-function enterMeasureMode() {
-  measureMode = true;
-  measureHoverPt = null;
-
-  // Enable canvases on calibrated videos
-  drawingData.forEach((data, idx) => {
-    if (calibrations.has(idx)) {
-      data.canvas.classList.add('measure-active');
-    }
-  });
-
-  if (heightRef) {
-    showToast('Click the ball — Shift+click to set a new reference point');
-  } else {
-    showToast('Click a reference point of known height');
-  }
-}
-
-function exitMeasureMode() {
-  measureMode = false;
-  measureHoverPt = null;
-  // heightRef persists intentionally
-
-  drawingData.forEach(data => {
-    data.canvas.classList.remove('measure-active');
-  });
-
-  redrawAllCanvases();
-}
-
-function handleMeasureClick(videoIdx, norm, shiftKey) {
-  if (!calibrations.has(videoIdx)) {
-    showToast('This video is not calibrated — draw a circle around the ball first (C)');
-    return;
-  }
-
-  // Shift+click resets reference, first click sets it
-  if (shiftKey || !heightRef) {
-    const defaultH = heightRef ? heightRef.height : 0;
-    const input = prompt('Height at this reference point (m):', defaultH);
-    if (input === null) return;  // cancelled
-    const refH = parseFloat(input);
-    if (isNaN(refH)) { showToast('Invalid height value'); return; }
-    heightRef = { y: norm.y, videoIdx, height: refH };
-    redrawAllCanvases();
-    showToast(`Reference set at ${refH} m — now click the ball`);
-    return;  // stay in measure mode for ball click
-  }
-
-  // Normal click with reference set — measure ball height
-  const cal = calibrations.get(videoIdx);
-  const scale = cal.diameter / (2 * cal.rNorm);
-  const height = heightRef.height + (heightRef.y - norm.y) * scale;
-
-  if (editingAnnotationIdx !== null && annotations[editingAnnotationIdx]) {
-    annotations[editingAnnotationIdx].height = parseFloat(height.toFixed(4));
-    annotations[editingAnnotationIdx].heightUnit = 'm';
-    updateHeightSection();
-    renderAnnotations();
-    showToast(`Height: ${height.toFixed(3)} m`);
-  }
-
-  exitMeasureMode();
-}
-
 // Draw button event
 $('btn-draw').addEventListener('click', () => toggleDrawingMode());
-$('btn-calibrate').addEventListener('click', () => toggleCalibrateMode());
-
-// Height section event listeners
-$('btn-measure').addEventListener('click', () => {
-  if (calibrations.size === 0) {
-    showToast('No videos calibrated — use Calibrate tool in Draw mode first');
-    return;
-  }
-  if (editingAnnotationIdx === null) {
-    showToast('Select a touch to edit first');
-    return;
-  }
-  enterMeasureMode();
-});
-
-$('height-input').addEventListener('change', e => {
-  if (editingAnnotationIdx === null) return;
-  const val = e.target.value.trim();
-  if (val === '') {
-    annotations[editingAnnotationIdx].height = null;
-    annotations[editingAnnotationIdx].heightUnit = null;
-  } else {
-    annotations[editingAnnotationIdx].height = parseFloat(val);
-    if (!annotations[editingAnnotationIdx].heightUnit) {
-      annotations[editingAnnotationIdx].heightUnit = 'm';
-    }
-  }
-  renderAnnotations();
-});
 
 // ═══════════════════════════════════════════════════════════
 // ZOOM & PAN
@@ -2469,12 +1857,13 @@ const HELP_CONTENT = {
     body: `
       <div class="help-section">
         <h3>Goal</h3>
-        <p>Align all your videos to the <strong>same real-world moment</strong> so the frame counter stays in sync across every camera angle.</p>
+        <p>Align all your videos to the <strong>same real-world moment</strong> so the frame counter stays in sync across every camera angle. This moment becomes <code>masterTime = 0</code>.</p>
+        <p>With only <strong>one</strong> video uploaded, any frame can be set as "frame 0".</p>
       </div>
       <div class="help-section">
         <h3>Steps</h3>
         <ol class="help-steps">
-          <li data-n="1">Pick a clear, unambiguous event visible in all videos, such as a ball bounce.</li>
+          <li data-n="1">Pick a clear, unambiguous event visible in every video — a ball bounce, a whistle, a clap.</li>
           <li data-n="2">Scrub each video panel independently to that exact moment using the scrubber or frame-step buttons.</li>
           <li data-n="3">Click <strong>Set Sync Point</strong> in each panel. The dot in the footer turns green when set.</li>
           <li data-n="4">Once all dots are green, click <strong>Annotate →</strong> to begin logging touches.</li>
@@ -2490,7 +1879,7 @@ const HELP_CONTENT = {
         </table>
       </div>
       <div class="help-tip">
-        <strong>Tip:</strong> The sharper the sync event the better. A discrete ball contact or a visible clap gives you sub-frame accuracy.
+        <strong>Tip:</strong> The sharper the sync event, the better. A discrete ball contact or a visible clap gives you sub-frame accuracy. If it's hard to find the exact frame, play at a slower speed or step through with <span class="kbd">←</span> <span class="kbd">→</span>.
       </div>
     `,
   },
@@ -2499,19 +1888,22 @@ const HELP_CONTENT = {
     body: `
       <div class="help-section">
         <h3>Goal</h3>
-        <p>Scrub or play through the synced videos and log every ball touch with its type and body part. The frame counter at the bottom-left shows the synced frame across all cameras.</p>
+        <p>Scrub or play through the synced videos and log every ball touch with its type and body part. The big frame counter at the bottom-left is on the master timeline (frame 0 = the sync moment).</p>
       </div>
       <div class="help-section">
         <h3>Logging a touch</h3>
         <ol class="help-steps">
-          <li data-n="1">Pause on the frame of contact (use <strong>← →</strong> for fine control).</li>
-          <li data-n="2">Select a touch type (Bounce / Kick / Touch) and body part (Foot / Knee / Chest / Arm / Head) — or skip and assign later.</li>
-          <li data-n="3">Press <strong>T</strong> or click <strong>Log Touch</strong>. The touch appears in the list on the right.</li>
+          <li data-n="1">Pause on the frame of contact (use <span class="kbd">←</span> <span class="kbd">→</span> for fine control; try 0.25× playback to spot it).</li>
+          <li data-n="2">Pick a touch type: <strong>Bounce</strong>, <strong>Kick</strong>, or <strong>Touch</strong>. If it's a <strong>Touch</strong>, also pick a body part (Foot / Knee / Chest / Arm / Head). You can skip and assign later.</li>
+          <li data-n="3">Press <span class="kbd">T</span> or click <strong>Log Touch</strong>. The row appears in the sidebar.</li>
         </ol>
       </div>
       <div class="help-section">
-        <h3>Editing a logged touch</h3>
-        <p>Click any row in the touch list to <strong>seek to that frame</strong> and select it for editing. Then click a touch type / body part button to assign or change it. The row is highlighted in blue while selected.</p>
+        <h3>Editing, deleting, clearing</h3>
+        <p><strong>Edit:</strong> click any row — the app seeks to that frame and puts the row in edit mode (blue highlight). Click a Touch Type / Body Part button to reassign.</p>
+        <p><strong>Delete one:</strong> hover a row and click the <span class="kbd">✕</span> on the right.</p>
+        <p><strong>Clear all:</strong> click <strong>Clear</strong> at the bottom of the sidebar (asks to confirm).</p>
+        <p><strong>Go back to sync:</strong> click <strong>Re-sync</strong> in the transport bar to return to the Sync screen without losing annotations.</p>
       </div>
       <div class="help-section">
         <h3>Keyboard shortcuts</h3>
@@ -2522,7 +1914,16 @@ const HELP_CONTENT = {
           <tr><td><span class="kbd">T</span></td><td>Log touch at current frame</td></tr>
           <tr><td><span class="kbd">1</span>–<span class="kbd">3</span></td><td>Touch type: Bounce · Kick · Touch</td></tr>
           <tr><td><span class="kbd">4</span>–<span class="kbd">8</span></td><td>Body part: Foot · Knee · Chest · Arm · Head</td></tr>
+          <tr><td><span class="kbd">0</span></td><td>Reset zoom on all videos</td></tr>
           <tr><td><span class="kbd">H</span> or <span class="kbd">?</span></td><td>Open this help panel</td></tr>
+        </table>
+      </div>
+      <div class="help-section">
+        <h3>Transport bar</h3>
+        <table class="help-keys">
+          <tr><td><strong>Speed</strong></td><td>Playback rate: 0.05× to 2×. Use 0.25× to spot fast contacts.</td></tr>
+          <tr><td><strong>Real×</strong></td><td>Multiplier for <code>real_time_s</code> in the CSV (for slow-motion footage: e.g. 240 fps captured at 60 fps → set Real× = 4). Saved in the export metadata.</td></tr>
+          <tr><td><strong>Re-sync</strong></td><td>Return to the Sync screen (annotations persist).</td></tr>
         </table>
       </div>
       <div class="help-section">
@@ -2530,42 +1931,33 @@ const HELP_CONTENT = {
         <table class="help-keys">
           <tr><td><span class="kbd">D</span></td><td>Toggle drawing mode on/off</td></tr>
           <tr><td><span class="kbd">F</span></td><td>Switch to freehand tool</td></tr>
-          <tr><td><span class="kbd">L</span></td><td>Switch to straight line tool</td></tr>
+          <tr><td><span class="kbd">L</span></td><td>Switch to straight line tool (optional angle snap in toolbar)</td></tr>
           <tr><td><span class="kbd">E</span></td><td>Switch to eraser tool (click elements to erase)</td></tr>
-          <tr><td><span class="kbd">C</span></td><td>Toggle calibration mode (separate from draw)</td></tr>
           <tr><td><span class="kbd">Del</span> / <span class="kbd">⌫</span></td><td>Delete selected drawing</td></tr>
-          <tr><td><span class="kbd">Esc</span></td><td>Cancel line / deselect / exit drawing / cancel measurement</td></tr>
+          <tr><td><span class="kbd">Esc</span></td><td>Cancel line / deselect / exit drawing</td></tr>
         </table>
-        <p style="margin-top:6px;">Click near a drawn element to select it (highlighted with glow). Drawings persist across frame changes.</p>
-      </div>
-      <div class="help-section">
-        <h3>Height calibration &amp; measurement</h3>
-        <ol class="help-steps">
-          <li data-n="1">Press <strong>C</strong> or click <strong>⊿ Calibrate</strong> to enter calibration mode.</li>
-          <li data-n="2">Drag a circle around the ball. Adjust by dragging inside (move) or near the edge (resize).</li>
-          <li data-n="3">Press <strong>Enter</strong> to confirm, then set the ball diameter in the popover (default 0.22 m).</li>
-          <li data-n="4">Log a touch, select it in the list, then click <strong>Measure ▲</strong> in the Height section.</li>
-          <li data-n="5">First time: click a reference point of known height (e.g. ground, table edge). Enter the height at that point (0 for ground).</li>
-          <li data-n="6">Click the ball — height is computed relative to the reference and saved to the selected touch.</li>
-          <li data-n="7">For subsequent touches: just select and click the ball (reference persists). <strong>Shift+click</strong> to set a new reference.</li>
-        </ol>
-        <p style="margin-top:6px;">A live height readout appears while hovering. You can also type a height value manually. Use <strong>Hide</strong> / <strong>Clear All</strong> in the calibrate toolbar to manage visuals.</p>
+        <p style="margin-top:6px;">Click near a drawn element to select it (highlighted with glow). 5-color palette in the toolbar. Drawings persist across frame changes.</p>
       </div>
       <div class="help-section">
         <h3>Zoom &amp; Pan</h3>
         <table class="help-keys">
-          <tr><td>Scroll wheel</td><td>Zoom in/out on video (zooms toward cursor)</td></tr>
+          <tr><td>Scroll wheel</td><td>Zoom in/out on video (zooms toward cursor, 1× to 8×)</td></tr>
           <tr><td>Drag</td><td>Pan when zoomed in (exit draw mode first)</td></tr>
           <tr><td>Double-click</td><td>Reset zoom on that video</td></tr>
           <tr><td><span class="kbd">0</span></td><td>Reset zoom on all videos</td></tr>
         </table>
       </div>
       <div class="help-section">
-        <h3>Exporting</h3>
-        <p>Click <strong>Export CSV</strong> when done. Columns: <code>frame</code>, <code>time_s</code>, <code>touch_type</code>, <code>body_part</code>, <code>height</code>, <code>height_unit</code>, plus one column per video showing that touch's local frame number.</p>
+        <h3>Export &amp; reload</h3>
+        <p>Click <strong>Export CSV</strong> to download <code>touches_&lt;timestamp&gt;.csv</code>. Columns: <code>frame</code>, <code>time_s</code>, <code>real_time_s</code>, <code>touch_type</code>, <code>body_part</code>, plus one column per video (<code>frame_N_&lt;videoname&gt;</code>) giving that touch's local frame in each camera.</p>
+        <p>The first line is a <code>#meta</code> comment encoding per-video sync offsets, FPS, and the real-time factor. Other tools can ignore it.</p>
+        <p><strong>To reload a session:</strong> on the Upload screen, drop the MP4s <em>and</em> the CSV together. The app restores sync, FPS, and all prior touches, then jumps straight to Annotate.</p>
       </div>
       <div class="help-tip">
-        <strong>Tip:</strong> Use slow playback (0.25×) to spot contacts. Log first, assign surfaces after — it's faster than stopping for each one.
+        <strong>Heads up:</strong> no autosave — <strong>export before closing the tab</strong>. Duplicate touches on the same master frame are rejected (delete the first to replace it).
+      </div>
+      <div class="help-tip">
+        <strong>Tip:</strong> Log first, assign surfaces after — it's faster than stopping for each touch. Click a row later to seek and reassign.
       </div>
     `,
   },

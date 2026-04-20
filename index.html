@@ -504,39 +504,6 @@
     }
     .help-btn:hover { border-color: var(--accent); color: var(--accent); }
 
-    /* ── Calibration popover ── */
-    .calibration-popover {
-      display: none;
-      position: absolute; top: 44px; left: 50%;
-      transform: translateX(-50%);
-      z-index: 21;
-      background: var(--surface);
-      border: 1px solid var(--accent);
-      border-radius: 8px;
-      padding: 10px 14px;
-      gap: 8px;
-      align-items: center;
-      white-space: nowrap;
-    }
-    .calibration-popover.visible { display: flex; }
-    .calibration-popover input[type="number"] {
-      width: 64px; padding: 4px 8px;
-      background: var(--surface2); border: 1px solid var(--border);
-      border-radius: 4px; color: var(--text); font-size: 13px; outline: none;
-    }
-    .calibration-popover input[type="number"]:focus { border-color: var(--accent); }
-    .calibration-popover select {
-      padding: 4px 6px;
-      background: var(--surface2); border: 1px solid var(--border);
-      border-radius: 4px; color: var(--text); font-size: 12px; cursor: pointer;
-    }
-
-    /* ── Measure mode cursor ── */
-    .draw-overlay.measure-active {
-      pointer-events: auto;
-      cursor: crosshair;
-    }
-
     /* ── Scrollbars ── */
     ::-webkit-scrollbar { width: 5px; height: 5px; }
     ::-webkit-scrollbar-track { background: transparent; }
@@ -637,12 +604,7 @@
             <input type="number" id="real-time-factor" min="0.000001" step="0.000001" value="1"
                    style="width:84px;padding:4px 6px;background:var(--surface2);border:1px solid var(--border);color:var(--text);border-radius:5px;font-size:12px;">
           </label>
-          <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--text-dim);margin-left:4px;" title="Advance exactly one frame per tick; slower but avoids frame skipping on high-FPS videos.">
-            <input type="checkbox" id="frame-accurate-mode">
-            Frame-accurate
-          </label>
           <button class="btn btn-sm" id="btn-draw" title="Toggle drawing mode (D)" style="margin-left:4px;">✏ Draw</button>
-          <button class="btn btn-sm" id="btn-calibrate" title="Toggle calibration mode (C)" style="margin-left:4px;">⊿ Calibrate</button>
           <button class="help-btn" id="annotate-help-btn" title="Help" style="margin-left:4px;">? Help</button>
           <button class="btn btn-sm" id="btn-re-sync" title="Go back to sync screen" style="margin-left:4px;">Re-sync</button>
         </div>
@@ -668,14 +630,6 @@
             <button class="surface-btn" data-body-part="chest">Chest</button>
             <button class="surface-btn" data-body-part="arm">Arm</button>
             <button class="surface-btn" data-body-part="head">Head</button>
-          </div>
-        </div>
-        <div id="height-section" style="display:none; margin-top:10px;">
-          <label style="font-size:11px;color:var(--text-dim);text-transform:uppercase;letter-spacing:0.05em;display:block;margin-bottom:6px;">Height</label>
-          <div style="display:flex;align-items:center;gap:6px;">
-            <button class="btn btn-sm" id="btn-measure" title="Click two points on a calibrated video to measure height">Measure ▲</button>
-            <input type="number" id="height-input" style="width:70px;padding:5px 8px;background:var(--surface2);border:1px solid var(--border);border-radius:5px;color:var(--text);font-size:13px;outline:none;" placeholder="—" step="0.01" min="0">
-            <span id="height-unit-label" style="font-size:12px;color:var(--text-dim);">m</span>
           </div>
         </div>
         <button class="log-btn" id="log-btn" disabled>
