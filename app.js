@@ -132,7 +132,7 @@ function addFiles(files) {
     showToast(`Max 4 videos — added ${toAdd.length}`);
   }
   toAdd.forEach(file => {
-    videoItems.push({ file, name: file.name, objectUrl: null, el: null, fps: null, syncOffset: 0 });
+    videoItems.push({ file, name: file.name, objectUrl: null, el: null, fps: null, frameTimes: null, containerFps: null, syncOffset: 0 });
   });
   renderFileList();
 }
@@ -194,41 +194,28 @@ uploadContinue.addEventListener('click', () => {
 // ═══════════════════════════════════════════════════════════
 // FPS DETECTION
 // ═══════════════════════════════════════════════════════════
+// Primary: parse the exact frame timestamps out of the MP4/MOV container
+// (see CONTAINER TIMING below) — deterministic and instant, unaffected by
+// decode load or dropped frames. Playback measurement survives only as a
+// last resort for containers we can't parse (e.g. WebM), and then runs one
+// video at a time with a median filter so dropped frames can't skew it.
 
 async function startFpsDetection() {
   $('fps-overlay').classList.add('show');
   $('fps-status').textContent = 'Initialising…';
 
-  // Create object URLs and video elements
-  for (const item of videoItems) {
-    if (!item.objectUrl) {
-      item.objectUrl = URL.createObjectURL(item.file);
-    }
-    if (!item.el) {
-      const video = document.createElement('video');
-      video.src        = item.objectUrl;
-      video.preload    = 'auto';
-      video.muted      = true;
-      video.playsInline = true;
-      video.controls   = false;
-      item.el = video;
-      await waitForMetadata(video);
-    }
+  const broken = await prepareVideoElements();
+  if (broken.length) {
+    $('fps-overlay').classList.remove('show');
+    showToast(`Cannot play: ${broken.join(', ')} — file may be corrupt or unsupported`);
+    return;
   }
 
-  // Detect FPS for all videos in parallel
-  const total = videoItems.length;
-  let done = 0;
-  const updateStatus = () => {
-    $('fps-status').textContent = `Detecting FPS — ${done} / ${total} done…`;
-  };
-  updateStatus();
-  await Promise.all(videoItems.map(async (item) => {
-    item.fps = await detectFPS(item.el);
-    done++;
-    updateStatus();
-  }));
-  $('fps-status').textContent = videoItems.map((v, i) => `Video ${i + 1}: ${v.fps} fps`).join('  ·  ') + ' ✓';
+  $('fps-status').textContent = 'Reading frame timestamps…';
+  await detectAllFps(status => { $('fps-status').textContent = status; });
+
+  $('fps-status').textContent =
+    videoItems.map((v, i) => `Video ${i + 1}: ${formatFps(v.fps)} fps`).join('  ·  ') + ' ✓';
   await sleep(400);
 
   // First video drives the master frame counter
@@ -239,66 +226,338 @@ async function startFpsDetection() {
   showScreen('sync');
 }
 
+// Create object URLs + video elements; returns the names of unplayable files.
+async function prepareVideoElements() {
+  const broken = [];
+  for (const item of videoItems) {
+    if (!item.objectUrl) item.objectUrl = URL.createObjectURL(item.file);
+    if (!item.el) {
+      const video = document.createElement('video');
+      video.src         = item.objectUrl;
+      video.preload     = 'auto';
+      video.muted       = true;
+      video.playsInline = true;
+      video.controls    = false;
+      try {
+        await waitForMetadata(video);
+        item.el = video;
+      } catch {
+        broken.push(item.name);
+      }
+    }
+  }
+  return broken;
+}
+
+// Fill in item.fps (+ frameTimes when parseable) for every video.
+async function detectAllFps(onStatus) {
+  await Promise.all(videoItems.map(attachContainerTiming));
+  for (const item of videoItems) {
+    if (item.containerFps) { item.fps = item.containerFps; continue; }
+    onStatus(`Measuring frame rate — ${item.name}…`);
+    item.fps = await measurePlaybackFps(item.el);
+  }
+}
+
+// Parse exact frame timestamps from the container; sets frameTimes + containerFps.
+async function attachContainerTiming(item) {
+  if (item.frameTimes) return;
+  try {
+    const timing = await parseContainerTiming(item.file);
+    if (timing && timing.frameCount > 1) {
+      item.frameTimes   = timing.frameTimes;
+      item.containerFps = roundFps(timing.nominalFps);
+    }
+  } catch (err) {
+    console.warn(`Container parse failed for ${item.name}:`, err);
+  }
+}
+
 function waitForMetadata(video) {
-  return new Promise(resolve => {
+  return new Promise((resolve, reject) => {
     if (video.readyState >= 1) { resolve(); return; }
     video.addEventListener('loadedmetadata', resolve, { once: true });
+    video.addEventListener('error',
+      () => reject(new Error(video.error ? video.error.message : 'decode error')),
+      { once: true });
   });
 }
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-function sampleFPS(video, playbackRate, sampleFrames, timeoutMs) {
+// Last-resort fps measurement. Median of presented-frame intervals: a
+// dropped frame produces one double-length outlier instead of corrupting
+// a start/end average, so the result is stable.
+function measurePlaybackFps(video, sampleCount = 48, timeoutMs = 8000) {
+  if (!('requestVideoFrameCallback' in HTMLVideoElement.prototype)) {
+    return Promise.resolve(25);
+  }
   return new Promise(resolve => {
-    let count = 0;
-    let startMedia = null;
+    const deltas = [];
+    let lastMediaTime = null;
     let settled = false;
     const savedTime = video.currentTime;
 
-    const startAt = Math.min(2, (video.duration || 10) * 0.05);
-    video.currentTime = startAt;
-    video.playbackRate = playbackRate;
-
-    const finish = (fps) => {
+    const finish = () => {
       if (settled) return;
       settled = true;
       video.pause();
       video.currentTime = savedTime;
-      resolve(fps);
+      if (deltas.length < 8) { resolve(25); return; }
+      deltas.sort((a, b) => a - b);
+      const median = deltas[deltas.length >> 1];
+      resolve(median > 0 ? snapFps(1 / median) : 25);
     };
 
     const onFrame = (now, meta) => {
       if (settled) return;
-      if (startMedia === null) {
-        startMedia = meta.mediaTime;
-        count = 0;
-      } else {
-        count++;
-        if (count >= sampleFrames) {
-          const elapsed = meta.mediaTime - startMedia;
-          finish(elapsed > 0 ? Math.round(count / elapsed) : 0);
-          return;
-        }
+      if (lastMediaTime !== null && meta.mediaTime > lastMediaTime) {
+        deltas.push(meta.mediaTime - lastMediaTime);
       }
+      lastMediaTime = meta.mediaTime;
+      if (deltas.length >= sampleCount) { finish(); return; }
       video.requestVideoFrameCallback(onFrame);
     };
 
+    video.currentTime  = Math.min(2, (video.duration || 10) * 0.05);
+    video.playbackRate = 1;
     video.requestVideoFrameCallback(onFrame);
-    video.play().catch(() => finish(0));
-
-    setTimeout(() => finish(0), timeoutMs);
+    video.play().catch(() => finish());
+    setTimeout(finish, timeoutMs);
   });
 }
 
-async function detectFPS(video) {
-  if (!('requestVideoFrameCallback' in HTMLVideoElement.prototype)) {
-    return 25;
+// Snap a measured fps to the nearest standard rate (within 1%).
+const STANDARD_FPS = [23.976, 24, 25, 29.97, 30, 48, 50, 59.94, 60, 90, 100, 119.88, 120, 240];
+function snapFps(fps) {
+  for (const std of STANDARD_FPS) {
+    if (Math.abs(fps - std) / std < 0.01) return std;
   }
-  const fps = await sampleFPS(video, 1, 30, 8000);
-  if (fps > 0) {
-    return Math.max(10, Math.min(10000, fps));
+  return roundFps(fps);
+}
+
+function roundFps(fps) { return Math.round(fps * 1000) / 1000; }
+
+function formatFps(fps) { return String(parseFloat(Number(fps).toFixed(3))); }
+
+// ═══════════════════════════════════════════════════════════
+// CONTAINER TIMING — exact frame timestamps from MP4/QuickTime
+// ═══════════════════════════════════════════════════════════
+// Reads the moov box via File.slice() byte-range reads (never loads the
+// whole file) and extracts the video track's exact per-frame presentation
+// timestamps: stts (durations) + ctts (B-frame reordering) + elst (edit
+// list, which Chrome applies to the playback timeline). The same file
+// always yields the same result, even for VFR recordings like iPhone
+// footage — nominal fps = timescale / most-common frame duration.
+
+function box4cc(dv, off) {
+  return String.fromCharCode(dv.getUint8(off), dv.getUint8(off + 1), dv.getUint8(off + 2), dv.getUint8(off + 3));
+}
+
+// Iterate the child boxes of dv[start, end)
+function* mp4Boxes(dv, start, end) {
+  let pos = start;
+  while (pos + 8 <= end) {
+    let size = dv.getUint32(pos);
+    const type = box4cc(dv, pos + 4);
+    let header = 8;
+    if (size === 1) {                 // 64-bit box size
+      if (pos + 16 > end) return;
+      size = dv.getUint32(pos + 8) * 4294967296 + dv.getUint32(pos + 12);
+      header = 16;
+    } else if (size === 0) {          // box extends to end of enclosure
+      size = end - pos;
+    }
+    if (size < header || pos + size > end) return;
+    yield { type, start: pos + header, end: pos + size };
+    pos += size;
   }
-  return 25;
+}
+
+function mp4FindBox(dv, parent, type) {
+  for (const b of mp4Boxes(dv, parent.start, parent.end)) if (b.type === type) return b;
+  return null;
+}
+
+function mp4FindPath(dv, parent, path) {
+  let cur = parent;
+  for (const type of path) {
+    cur = mp4FindBox(dv, cur, type);
+    if (!cur) return null;
+  }
+  return cur;
+}
+
+// Scan top-level boxes with small range reads and load only the moov box.
+async function loadMoovBox(file) {
+  let pos = 0;
+  while (pos + 8 <= file.size) {
+    const head = new DataView(await file.slice(pos, Math.min(pos + 16, file.size)).arrayBuffer());
+    if (head.byteLength < 8) return null;
+    let size = head.getUint32(0);
+    const type = box4cc(head, 4);
+    let header = 8;
+    if (size === 1) {
+      if (head.byteLength < 16) return null;
+      size = head.getUint32(8) * 4294967296 + head.getUint32(12);
+      header = 16;
+    } else if (size === 0) {
+      size = file.size - pos;
+    }
+    if (size < header) return null;
+    if (type === 'moov') {
+      const dv = new DataView(await file.slice(pos, Math.min(pos + size, file.size)).arrayBuffer());
+      return { dv, box: { type, start: header, end: dv.byteLength } };
+    }
+    pos += size;
+  }
+  return null;
+}
+
+async function parseContainerTiming(file) {
+  const moov = await loadMoovBox(file);
+  if (!moov) return null;
+  const { dv, box } = moov;
+
+  // Movie timescale (needed to convert empty-edit durations to seconds)
+  let movieTimescale = 0;
+  const mvhd = mp4FindBox(dv, box, 'mvhd');
+  if (mvhd) {
+    movieTimescale = dv.getUint32(mvhd.start + (dv.getUint8(mvhd.start) === 1 ? 20 : 12));
+  }
+
+  for (const trak of mp4Boxes(dv, box.start, box.end)) {
+    if (trak.type !== 'trak') continue;
+    const hdlr = mp4FindPath(dv, trak, ['mdia', 'hdlr']);
+    if (!hdlr || box4cc(dv, hdlr.start + 8) !== 'vide') continue;
+
+    const mdhd = mp4FindPath(dv, trak, ['mdia', 'mdhd']);
+    const stbl = mp4FindPath(dv, trak, ['mdia', 'minf', 'stbl']);
+    const stts = stbl && mp4FindBox(dv, stbl, 'stts');
+    if (!mdhd || !stts) return null;
+
+    const timescale = dv.getUint32(mdhd.start + (dv.getUint8(mdhd.start) === 1 ? 20 : 12));
+    if (!timescale) return null;
+
+    // stts — run-length encoded per-frame durations, decode order
+    const sttsN = dv.getUint32(stts.start + 4);
+    let total = 0;
+    for (let i = 0; i < sttsN; i++) total += dv.getUint32(stts.start + 8 + i * 8);
+    if (!total) return null;
+
+    const durations = new Uint32Array(total);
+    const durationCounts = new Map();   // frame duration → number of frames
+    let k = 0, totalTicks = 0;
+    for (let i = 0; i < sttsN; i++) {
+      const count = dv.getUint32(stts.start + 8 + i * 8);
+      const delta = dv.getUint32(stts.start + 12 + i * 8);
+      durationCounts.set(delta, (durationCounts.get(delta) || 0) + count);
+      totalTicks += count * delta;
+      for (let j = 0; j < count; j++) durations[k++] = delta;
+    }
+
+    // pts = dts + ctts offset (decode order), then sort → presentation order
+    const pts = new Float64Array(total);
+    let dts = 0, s = 0;
+    const ctts = mp4FindBox(dv, stbl, 'ctts');
+    if (ctts) {
+      const cttsN = dv.getUint32(ctts.start + 4);
+      for (let i = 0; i < cttsN && s < total; i++) {
+        const count  = dv.getUint32(ctts.start + 8 + i * 8);
+        const offset = dv.getInt32(ctts.start + 12 + i * 8);
+        for (let j = 0; j < count && s < total; j++, s++) {
+          pts[s] = dts + offset;
+          dts += durations[s];
+        }
+      }
+    }
+    for (; s < total; s++) { pts[s] = dts; dts += durations[s]; }
+    pts.sort();
+
+    // elst — edit list shifts the presentation timeline (Chrome applies it)
+    let editStartTicks = 0;   // media time presented at t=0 (media timescale)
+    let emptyDelaySec  = 0;   // leading blank segment (movie timescale)
+    const elst = mp4FindPath(dv, trak, ['edts', 'elst']);
+    if (elst) {
+      const v = dv.getUint8(elst.start);
+      const entryCount = dv.getUint32(elst.start + 4);
+      let p = elst.start + 8;
+      for (let i = 0; i < entryCount; i++) {
+        const segDur    = v === 1 ? Number(dv.getBigUint64(p)) : dv.getUint32(p);
+        const mediaTime = v === 1 ? Number(dv.getBigInt64(p + 8)) : dv.getInt32(p + 4);
+        if (mediaTime === -1) {
+          if (movieTimescale) emptyDelaySec += segDur / movieTimescale;
+        } else {
+          editStartTicks = mediaTime;
+          if (i + 1 < entryCount) console.warn(`${file.name}: multiple edit-list segments — using the first`);
+          break;
+        }
+        p += v === 1 ? 20 : 12;
+      }
+    }
+
+    const frameTimes = new Float64Array(total);
+    for (let i = 0; i < total; i++) {
+      frameTimes[i] = (pts[i] - editStartTicks) / timescale + emptyDelaySec;
+    }
+
+    let modeDelta = 0, modeCount = -1;
+    for (const [delta, count] of durationCounts) {
+      if (delta > 0 && count > modeCount) { modeCount = count; modeDelta = delta; }
+    }
+    if (!modeDelta) return null;
+
+    return {
+      frameTimes,
+      frameCount: total,
+      nominalFps: timescale / modeDelta,
+      avgFps: total / (totalTicks / timescale),
+    };
+  }
+  return null;   // no video track found
+}
+
+// ═══════════════════════════════════════════════════════════
+// EXACT FRAME INDEX ↔ TIME
+// ═══════════════════════════════════════════════════════════
+// frameTimes[i] is the exact start-of-display time of frame i.
+
+const FRAME_EPS = 1e-4;   // tolerance for float noise at frame boundaries
+
+function timeToFrameIdx(item, t) {
+  const ft = item.frameTimes;
+  if (t + FRAME_EPS < ft[0]) return 0;
+  let lo = 0, hi = ft.length - 1;
+  while (lo < hi) {
+    const mid = (lo + hi + 1) >> 1;
+    if (ft[mid] <= t + FRAME_EPS) lo = mid; else hi = mid - 1;
+  }
+  return lo;
+}
+
+function frameIdxToTime(item, idx) {
+  const ft = item.frameTimes;
+  return ft[Math.max(0, Math.min(ft.length - 1, idx))];
+}
+
+// Middle of frame idx's display interval — seeking here guarantees Chrome
+// presents exactly this frame (a seek to the boundary itself can round to
+// a neighbouring frame).
+function frameMidTime(item, idx) {
+  const ft = item.frameTimes;
+  idx = Math.max(0, Math.min(ft.length - 1, idx));
+  const next = idx + 1 < ft.length ? ft[idx + 1] : ft[idx] + 1 / (item.fps || 30);
+  return (ft[idx] + next) / 2;
+}
+
+// Step a single video by one true frame (dir = ±1); 1/fps grid as fallback.
+function stepVideoFrame(item, dir) {
+  const el = item.el;
+  if (item.frameTimes) {
+    el.currentTime = frameMidTime(item, timeToFrameIdx(item, el.currentTime) + dir);
+  } else {
+    el.currentTime = Math.max(0, Math.min(el.duration, el.currentTime + dir / item.fps));
+  }
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -335,9 +594,9 @@ function buildSyncScreen() {
       <div class="sync-controls" style="flex-wrap:wrap;gap:8px;">
         <button class="sync-set-btn" data-i="${i}">Set Sync Point</button>
         <span class="sync-fps-row">
-          <span class="fps-badge">${item.fps} fps</span>
+          <span class="fps-badge">${formatFps(item.fps)} fps</span>
           <input type="number" class="btn btn-sm fps-override"
-                 min="1" max="10000" value="${item.fps}"
+                 min="1" max="10000" step="0.01" value="${formatFps(item.fps)}"
                  title="Override detected FPS" style="width:72px;text-align:center;">
         </span>
       </div>
@@ -391,16 +650,18 @@ function buildSyncScreen() {
     // Frame step buttons
     panel.querySelector('[data-action=prev]').addEventListener('click', () => {
       item.el.pause();
-      item.el.currentTime = Math.max(0, item.el.currentTime - 1 / item.fps);
+      stepVideoFrame(item, -1);
     });
     panel.querySelector('[data-action=next]').addEventListener('click', () => {
       item.el.pause();
-      item.el.currentTime = Math.min(item.el.duration, item.el.currentTime + 1 / item.fps);
+      stepVideoFrame(item, 1);
     });
 
-    // Set sync point
+    // Set sync point — snap to the exact start of the displayed frame
     setBtn.addEventListener('click', () => {
-      item.syncOffset = item.el.currentTime;
+      let t = item.el.currentTime;
+      if (item.frameTimes) t = frameIdxToTime(item, timeToFrameIdx(item, t));
+      item.syncOffset = t;
       syncStates[i].isSet = true;
       setBtn.classList.add('is-set');
       setBtn.textContent = `✓ ${item.syncOffset.toFixed(3)} s`;
@@ -409,10 +670,10 @@ function buildSyncScreen() {
 
     // FPS override
     fpsInput.addEventListener('change', () => {
-      const val = parseInt(fpsInput.value);
-      if (val >= 1 && val <= 10000) {
+      const val = parseFloat(fpsInput.value);
+      if (Number.isFinite(val) && val >= 1 && val <= 10000) {
         item.fps = val;
-        fpsBadge.textContent = val + ' fps';
+        fpsBadge.textContent = formatFps(val) + ' fps';
         scrubber.step = (1 / val).toFixed(6);
         if (i === 0) masterFPS = val;
       }
@@ -458,12 +719,12 @@ document.addEventListener('keydown', e => {
     case 'ArrowLeft':
       e.preventDefault();
       item.el.pause();
-      item.el.currentTime = Math.max(0, item.el.currentTime - 1 / item.fps);
+      stepVideoFrame(item, -1);
       break;
     case 'ArrowRight':
       e.preventDefault();
       item.el.pause();
-      item.el.currentTime = Math.min(item.el.duration, item.el.currentTime + 1 / item.fps);
+      stepVideoFrame(item, 1);
       break;
     case ' ':
       e.preventDefault();
@@ -520,7 +781,7 @@ function buildAnnotateScreen() {
 
     const fpsBadge = document.createElement('span');
     fpsBadge.className = 'video-cell-fps';
-    fpsBadge.textContent = item.fps + ' fps';
+    fpsBadge.textContent = formatFps(item.fps) + ' fps';
 
     // Move video element into this cell
     item.el.style.cssText = 'width:100%;height:100%;object-fit:contain;display:block;';
@@ -631,8 +892,14 @@ function seekToMaster(t) {
   for (const item of videoItems) {
     const target  = masterTime + item.syncOffset;
     const clamped = Math.max(0, Math.min(item.el.duration, target));
-    if (Math.abs(item.el.currentTime - clamped) > 0.001) {
-      item.el.currentTime = clamped;
+    // Seek to the middle of the target frame's display interval so Chrome
+    // deterministically presents that exact frame — a seek right at a frame
+    // boundary can round to the neighbouring frame.
+    const seekT = item.frameTimes
+      ? frameMidTime(item, timeToFrameIdx(item, clamped))
+      : clamped;
+    if (Math.abs(item.el.currentTime - seekT) > 0.001) {
+      item.el.currentTime = seekT;
     }
   }
 
@@ -713,15 +980,20 @@ function playbackLoop() {
 
 btnPlay .addEventListener('click', () => isPlaying ? pausePlayback() : startPlayback());
 
-btnPrev.addEventListener('click', () => {
-  pausePlayback();
-  seekToMaster(masterTime - 1 / masterFPS);
-});
+btnPrev.addEventListener('click', () => stepMaster(-1));
+btnNext.addEventListener('click', () => stepMaster(1));
 
-btnNext.addEventListener('click', () => {
+// Step the master timeline by one true frame of the first video (dir = ±1).
+function stepMaster(dir) {
   pausePlayback();
-  seekToMaster(masterTime + 1 / masterFPS);
-});
+  const m = videoItems[0];
+  if (m && m.frameTimes) {
+    const idx = timeToFrameIdx(m, masterTime + m.syncOffset) + dir;
+    seekToMaster(frameIdxToTime(m, idx) - m.syncOffset);
+  } else {
+    seekToMaster(masterTime + dir / masterFPS);
+  }
+}
 
 btnStart.addEventListener('click', () => { pausePlayback(); seekToMaster(masterMin); });
 btnEnd  .addEventListener('click', () => { pausePlayback(); seekToMaster(masterMax); });
@@ -1110,35 +1382,24 @@ async function startReviewSession() {
   $('fps-overlay').classList.add('show');
   $('fps-status').textContent = 'Preparing videos…';
 
-  // Create video elements + wait for metadata (duration etc.)
-  for (const item of videoItems) {
-    if (!item.objectUrl) item.objectUrl = URL.createObjectURL(item.file);
-    if (!item.el) {
-      const video = document.createElement('video');
-      video.src        = item.objectUrl;
-      video.preload    = 'auto';
-      video.muted      = true;
-      video.playsInline = true;
-      video.controls   = false;
-      item.el = video;
-      await waitForMetadata(video);
-    }
+  const broken = await prepareVideoElements();
+  if (broken.length) {
+    $('fps-overlay').classList.remove('show');
+    showToast(`Cannot play: ${broken.join(', ')} — file may be corrupt or unsupported`);
+    return;
   }
 
   let ok;
   if (parsed.meta && Array.isArray(parsed.meta.videos)) {
-    // New-format CSV: sync info embedded — no FPS detection needed
+    // New-format CSV: sync info embedded — fps comes from the CSV, but still
+    // attach exact container frame timestamps for frame-exact stepping/export
     $('fps-status').textContent = 'Restoring sync from CSV…';
+    await Promise.all(videoItems.map(attachContainerTiming));
     ok = applyMetaToVideos(parsed.meta.videos);
   } else {
     // Old-format CSV: detect FPS then derive offsets from per-video frame columns
     showToast('CSV has no sync metadata — detecting FPS to approximate sync');
-    for (let i = 0; i < videoItems.length; i++) {
-      $('fps-status').textContent = `Detecting FPS — video ${i + 1} / ${videoItems.length}…`;
-      videoItems[i].fps = await detectFPS(videoItems[i].el);
-      $('fps-status').textContent = `Video ${i + 1}: ${videoItems[i].fps} fps ✓`;
-      await sleep(350);
-    }
+    await detectAllFps(status => { $('fps-status').textContent = status; });
     ok = deriveSyncOffsetsFromCsv(parsed);
   }
 
@@ -1181,6 +1442,9 @@ $('export-csv').addEventListener('click', () => {
   const dataRows = annotations.map(a => {
     const perVideoFrames = videoItems.map(item => {
       const localTime = a.time + item.syncOffset;
+      // Exact frame index from container timestamps (VFR-safe); the uniform
+      // grid is only a fallback for unparseable containers
+      if (item.frameTimes) return timeToFrameIdx(item, localTime);
       return Math.round(localTime * item.fps);
     });
 

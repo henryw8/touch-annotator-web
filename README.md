@@ -50,7 +50,7 @@ No build, no dependencies, no install. Source files:
 
 ### 1. Upload
 
-Drag-and-drop or click the drop zone to select **1–4 MP4 files** from the same match. The app detects each video's frame rate automatically by playing it briefly off-screen and measuring `requestVideoFrameCallback` timing.
+Drag-and-drop or click the drop zone to select **1–4 MP4/MOV files** from the same match. The app reads each video's exact per-frame timestamps directly from the MP4/QuickTime container (moov → stts/ctts/elst) — deterministic and instant, with no playback involved. The reported fps is the nominal rate (timescale ÷ most common frame duration), e.g. iPhone "60 fps" recordings report 60 even though they are slightly variable-frame-rate internally.
 
 - Videos can have different framerates; the first video's FPS becomes the master frame counter.
 - You can also drop an **exported CSV** alongside the videos to reload a prior annotation session — see [Review / reload a prior session](#review--reload-a-prior-session).
@@ -202,7 +202,7 @@ For slow-motion footage (e.g. 240 fps captured, 60 fps file playing at 1/4 speed
 ## Browser requirements
 
 - Modern Chromium-based browser (Chrome, Edge, Brave, Arc) or Safari 16+ / Firefox 115+.
-- Uses `requestVideoFrameCallback` for FPS detection — available in Chromium and Safari since 2023; polyfilled fallback is not provided.
+- FPS/timestamp extraction parses the file directly and works everywhere; `requestVideoFrameCallback` is only used as a last-resort fps fallback for non-MP4 containers (e.g. WebM).
 - All processing is local: no video is uploaded anywhere.
 - A desktop is strongly recommended. Small windows and touch devices are not tested.
 
@@ -212,12 +212,12 @@ For slow-motion footage (e.g. 240 fps captured, 60 fps file playing at 1/4 speed
 
 - **No build step.** Vanilla HTML + JS. Open `index.html` directly.
 - **State model:**
-  - `videoItems[]` — one per video: `{ file, name, objectUrl, el, fps, syncOffset }`
+  - `videoItems[]` — one per video: `{ file, name, objectUrl, el, fps, frameTimes, containerFps, syncOffset }`
   - `annotations[]` — one per touch: `{ frame, time, touchType, bodyPart }`
   - `masterFPS`, `masterTime`, `masterMin`, `masterMax` — shared clock (first video drives)
   - `syncOffset` per video: seconds into that video corresponding to `masterTime = 0`
 - **Playback sync:** the first video is the master clock; secondary videos are re-seeked if they drift more than 80 ms.
-- **FPS detection** runs in parallel across videos and samples ~30 frames per video, capped at a few seconds.
+- **Frame timing** comes from parsing the MP4/QuickTime container (`parseContainerTiming`): only the moov box is read via `File.slice()` byte ranges, yielding `frameTimes` — the exact presentation timestamp of every frame, with B-frame reordering (ctts) and edit lists (elst) applied, matching Chrome's playback timeline. Frame stepping, seeking, and CSV export all use these exact timestamps (VFR-safe); seeks target the middle of a frame's display interval so Chrome deterministically presents the intended frame. Unparseable containers fall back to a sequential, median-filtered `requestVideoFrameCallback` measurement.
 
 ---
 
